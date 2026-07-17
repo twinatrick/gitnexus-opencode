@@ -33,11 +33,10 @@ export const SYSTEM_ADDENDUM_END = "<!-- gitnexus:system:end -->"
 export const STATIC_SYSTEM_ADDENDUM = `${SYSTEM_ADDENDUM_START}
 # GitNexus knowledge graph
 
-A \`<gitnexus_graph>\` envelope is delivered in user messages with the live
-list of indexed repos and their freshness — re-read it each turn. If absent
-(cwd has no local indexes), call \`gitnexus_list_repos\` once to discover
-repos indexed elsewhere; target them via the \`repo\` parameter on any
-gitnexus_* tool.
+A \`<gitnexus_graph>\` envelope in user messages lists repos indexed under the
+current directory tree, with freshness — re-read it each turn. It is NOT the
+full machine index: call \`gitnexus_list_repos\` to see repos indexed
+elsewhere, then target any of them via the \`repo\` parameter.
 
 ## Subagent propagation
 
@@ -88,10 +87,10 @@ ${SYSTEM_ADDENDUM_END}`
 export const STATIC_SYSTEM_ADDENDUM_SUBAGENT = `${SYSTEM_ADDENDUM_START}
 # GitNexus knowledge graph
 
-If a \`<gitnexus_graph>\` envelope is delivered in your user messages, it lists
-the repos currently indexed and reachable via the \`repo\` parameter. Re-read
-it each turn for live data. If absent, call \`gitnexus_list_repos\` once to
-discover repos indexed elsewhere on the machine.
+A \`<gitnexus_graph>\` envelope in your user messages lists repos indexed under
+the current directory tree, reachable via the \`repo\` parameter. Re-read it
+each turn for live data. It is NOT the full machine index: call
+\`gitnexus_list_repos\` to discover repos indexed elsewhere.
 
 ## Tools (your own calls)
 

@@ -79,7 +79,7 @@ describe("HintEnvelopeState: rebuildHintCache + freshness", () => {
     const env = state.getHintCache().envelope
     assert.match(env, /<gitnexus_graph\b/)
     assert.match(env, /<summary>/)
-    assert.match(env, /<indexed_repos>/)
+    assert.match(env, /<indexed_repos\b/)
     assert.match(env, /<rules>/)
     assert.match(env, /<\/gitnexus_graph>/)
   })
@@ -97,6 +97,13 @@ describe("HintEnvelopeState: rebuildHintCache + freshness", () => {
     const env = state.getHintCache().envelope
     assert.match(env, /name="weird&lt;name&gt;&amp;&quot;&apos;"/)
     assert.match(env, /path="\/tmp\/&lt;weird&gt;"/)
+  })
+
+  it("marks the indexed_repos list as cwd-tree scoped so the agent does not read it as the full machine index", () => {
+    state.rebuildHintCache([repo("myproj")])
+    const env = state.getHintCache().envelope
+    assert.match(env, /<indexed_repos\b[^>]*scope="cwd-tree"/)
+    assert.match(env, /gitnexus_list_repos/)
   })
 
   it("envelope cross-references the OPT_IN_MARKER as a reminder back to system rules", () => {

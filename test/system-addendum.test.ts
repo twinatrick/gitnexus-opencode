@@ -43,9 +43,10 @@ describe("STATIC_SYSTEM_ADDENDUM", () => {
     assert.match(STATIC_SYSTEM_ADDENDUM, /repo path=/)
   })
 
-  it("documents gitnexus_list_repos as the fallback when the user-message envelope is absent", () => {
+  it("frames the envelope as cwd-tree scoped, not the full machine index, with list_repos to reach the rest", () => {
     assert.match(STATIC_SYSTEM_ADDENDUM, /gitnexus_list_repos/)
-    assert.match(STATIC_SYSTEM_ADDENDUM, /If absent/)
+    assert.match(STATIC_SYSTEM_ADDENDUM, /current directory tree/)
+    assert.match(STATIC_SYSTEM_ADDENDUM, /NOT the\s+full machine index/)
   })
 
   it("frames the build-graph rule as a run-by-default for unindexed repos (not a predicted-cost threshold)", () => {
@@ -116,6 +117,11 @@ describe("STATIC_SYSTEM_ADDENDUM_SUBAGENT", () => {
     assert.match(STATIC_SYSTEM_ADDENDUM_SUBAGENT, /<gitnexus_graph>/)
     assert.match(STATIC_SYSTEM_ADDENDUM_SUBAGENT, /gitnexus_list_repos/)
     assert.match(STATIC_SYSTEM_ADDENDUM_SUBAGENT, /`repo`\s+parameter/)
+  })
+
+  it("frames the envelope as cwd-tree scoped, not the full machine index", () => {
+    assert.match(STATIC_SYSTEM_ADDENDUM_SUBAGENT, /current directory tree/)
+    assert.match(STATIC_SYSTEM_ADDENDUM_SUBAGENT, /NOT the\s+full machine index/)
   })
 
   it("retains the tool preference list", () => {

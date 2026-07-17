@@ -183,7 +183,7 @@ function buildEnvelope(indexed: RepoInfo[], freshness: GraphFreshness): string {
 
   return `<gitnexus_graph source="gitnexus" version="2" freshness="${freshness}">
 <summary>${escapeXml(freshnessSummary(freshness))}</summary>
-<indexed_repos>
+<indexed_repos scope="cwd-tree" note="repos under the current directory tree only; more may be indexed machine-wide (gitnexus_list_repos)">
 ${repoLines}
 </indexed_repos>
 <rules>See the GitNexus section of the system prompt for tool preference and subagent propagation rules (marker ${OPT_IN_MARKER}).</rules>
