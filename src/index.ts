@@ -114,9 +114,10 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
       async execute(args) {
         const repoPath = args.path || scanRoot
         try {
+          const analyzeArgs = config.indexOnly ? ["analyze", "--index-only", repoPath] : ["analyze", repoPath]
           const result = execFileSync(
             cmd[0],
-            [...cmd.slice(1), "analyze", repoPath],
+            [...cmd.slice(1), ...analyzeArgs],
             { encoding: "utf-8", timeout: 300000, cwd: repoPath }
           )
           return `Graph built successfully for ${repoPath}.\n${result}`

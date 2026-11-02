@@ -1,3 +1,20 @@
+
+function sanitizeXmlAttr(val: unknown): string {
+  return String(val ?? "")
+    .replace(/[\x00-\x1F\x7F]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function sanitizeXmlText(val: unknown): string {
+  return String(val ?? "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .replace(/<\/?gitnexus_graph[^>]*>/gi, "[stripped-envelope-tag]");
+}
+
 import { discoverRepos, type RepoInfo } from "./discovery.js"
 
 /**

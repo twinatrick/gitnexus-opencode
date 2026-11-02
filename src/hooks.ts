@@ -92,10 +92,11 @@ function analyzeInBackground(
   onDone: () => void,
 ) {
   const cmd = gitnexusCmd(config)
+  const analyzeArgs = config.indexOnly ? ["analyze", "--index-only", repoPath] : ["analyze", repoPath]
   const devNull = openSync("/dev/null", "w")
   let child
   try {
-    child = spawn(cmd[0], [...cmd.slice(1), "analyze", repoPath], {
+    child = spawn(cmd[0], [...cmd.slice(1), ...analyzeArgs], {
       stdio: ["ignore", devNull, devNull],
       detached: true,
       cwd: repoPath,
