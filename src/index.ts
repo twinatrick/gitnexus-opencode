@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process"
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
 import {
   loadConfig,
+  getDeprecatedConfigKeys,
   gitnexusCmd,
   buildAnalyzeArgs,
   checkGitNexusCliCompatibility,
@@ -21,11 +22,11 @@ import { createSessionRegistry, type SessionRegistry } from "./sessions.js"
 
 const TOAST_DELAY_MS = 6000 // heuristic: waits past oh-my-openagent spinner animation
 
-export function isGitNexusCliAvailable(
-  config: ReturnType<typeof loadConfig>,
-  options?: { env?: NodeJS.ProcessEnv; execRunner?: CliRunner },
-): boolean {
-  return checkGitNexusCliCompatibility(config, options).compatible
+export function isGitNexusCliAvailable(options?: {
+  env?: NodeJS.ProcessEnv
+  execRunner?: CliRunner
+}): boolean {
+  return checkGitNexusCliCompatibility(options).compatible
 }
 
 async function hydrateSubagentRegistry(
@@ -57,10 +58,23 @@ async function hydrateSubagentRegistry(
 const plugin: Plugin = async ({ directory, worktree, client }) => {
   const scanRoot = worktree ?? directory
   const config = loadConfig(scanRoot)
-  let disabled = false
+
+  // COMP-002: CLI availability is tracked separately from graph/index state.
+  // A missing CLI must never disable prompt injection for an existing index.
+  let cliAvailable = false
 
   const log = (message: string, level: "debug" | "info" | "warn" | "error" = "info") => {
     void client.app.log({ body: { service: "gitnexus", level, message } })
+  }
+
+  // SEC-004: Legacy package-source keys are ignored. Warn once per plugin load
+  // so users can remove stale `allowNpxFallback` / `gitnexusVersion` entries.
+  for (const warning of getDeprecatedConfigKeys(scanRoot)) {
+    log(
+      `Ignoring deprecated ${warning.scope} config key(s): ${warning.keys.join(", ")}. ` +
+        "This plugin never invokes npm/npx; install GitNexus locally or set GITNEXUS_BIN.",
+      "warn",
+    )
   }
 
   // Instance-scoped state. Each plugin(...) call — i.e. each workspace /
@@ -81,7 +95,7 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
   const toolHooks = createToolHooks({
     cwd: scanRoot,
     config,
-    disabled: () => disabled,
+    canAnalyze: () => cliAvailable,
     analyzeState,
     hintState,
   })
@@ -94,7 +108,10 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
   })
 
   const systemTransformHandler = createSystemTransformHandler({
-    disabled: () => disabled,
+    // Inject while the CLI is usable, or while a pre-existing index can still
+    // provide graph context without any CLI call (COMP-002).
+    shouldInject: () =>
+      cliAvailable || hintState.getHintCache().freshness !== "missing",
     isMain: (sessionID) => sessions.isMain(sessionID),
     log,
   })
@@ -110,13 +127,11 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
       async execute(args) {
         const repoPath = args.path || scanRoot
         try {
-          const cmd = gitnexusCmd(config)
-          if (cmd[0] !== "npx") {
-            const compat = checkGitNexusCliCompatibility(config)
-            if (!compat.compatible) {
-              return `Failed to build graph: ${compat.reason ?? "Incompatible GitNexus CLI"}`
-            }
+          const compat = checkGitNexusCliCompatibility()
+          if (!compat.compatible) {
+            return `Failed to build graph: ${compat.reason ?? "Incompatible GitNexus CLI"}`
           }
+          const cmd = gitnexusCmd()
           const analyzeArgs = buildAnalyzeArgs(repoPath, config)
           const result = execFileSync(
             cmd[0],
@@ -152,21 +167,23 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
         const sessionID = info?.id
         if (info?.id) sessions.trackCreated({ id: info.id, parentID: info.parentID })
 
-        const compat = checkGitNexusCliCompatibility(config)
-        if (!compat.compatible) {
-          log(
-            `CLI not available or incompatible (${compat.reason ?? "version check failed"}). Plugin disabled for this session.`,
-            "warn",
-          )
-          disabled = true
-          return
-        }
-
+        // COMP-002: Always refresh graph state and inject prompt context.
+        // CLI availability only gates actions that need to execute the CLI.
         const repos = discoverRepos(scanRoot, (msg) => log(msg, "warn"))
         hintState.refreshHintCache(scanRoot)
         log(`Discovered ${repos.length} repo(s): ${repos.map((r) => r.name).join(", ") || "none"}`)
 
-        if (config.autoRefreshStale) {
+        const compat = checkGitNexusCliCompatibility()
+        cliAvailable = compat.compatible
+
+        if (!compat.compatible) {
+          log(
+            `Local GitNexus CLI unavailable (${compat.reason ?? "version check failed"}). ` +
+              "Analyze and background refresh are disabled, but existing graph context stays active. " +
+              "Install gitnexus locally or set GITNEXUS_BIN.",
+            "warn",
+          )
+        } else if (config.autoRefreshStale) {
           for (const repo of repos) {
             if (repo.hasIndex && repo.isStale) {
               analyzeState.schedule(repo.path, config, scanRoot, hintState)
@@ -202,7 +219,6 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
     },
 
     "experimental.chat.messages.transform": async (input, output) => {
-      if (disabled) return
       await messagesTransformHandler(input, output)
     },
 

@@ -51,7 +51,7 @@ describe("GIT_MUTATION_RE", () => {
 // actually runs `git rev-parse`, so these tests rely on the gitnexus-opencode
 // repo root itself (the test runs from the package directory).
 // -----------------------------------------------------------------------
-import { extractGitDashCPath, createAnalyzeState } from "../src/hooks.js"
+import { extractGitDashCPath, createAnalyzeState, createToolHooks } from "../src/hooks.js"
 import { loadConfig, buildAnalyzeArgs } from "../src/config.js"
 import { createHintEnvelopeState } from "../src/hint-envelope.js"
 import { execFileSync } from "node:child_process"
@@ -106,6 +106,46 @@ describe("extractGitDashCPath", () => {
   })
 })
 
+describe("COMP-002: tool hints are decoupled from CLI availability", () => {
+  const config = loadConfig(undefined, { globalConfigPath: "/nonexistent-global.json" })
+  const hintState = createHintEnvelopeState()
+  const analyzeState = createAnalyzeState(() => {})
+
+  function runSkill(canAnalyze: boolean, cwd: string, name: string): string {
+    const output = { output: "base" }
+    createToolHooks({
+      cwd,
+      config,
+      canAnalyze: () => canAnalyze,
+      analyzeState,
+      hintState,
+    }).onToolExecuteAfter({ tool: "skill", args: { name } }, output)
+    return output.output
+  }
+
+  it("omits the init prerequisite when the CLI cannot run", () => {
+    const out = runSkill(false, REPO_ROOT, "init")
+    assert.equal(out, "base")
+  })
+
+  it("adds the init prerequisite when the CLI can run", () => {
+    const out = runSkill(true, REPO_ROOT, "init")
+    assert.match(out, /gitnexus_analyze/)
+  })
+
+  it("still advertises an existing graph when the CLI cannot run", () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), "gitnexus-hooks-index-"))
+    try {
+      mkdirSync(join(tmpRoot, ".gitnexus"), { recursive: true })
+      writeFileSync(join(tmpRoot, ".gitnexus", "meta.json"), "{}")
+      const out = runSkill(false, tmpRoot, "explore")
+      assert.match(out, /Code knowledge graph available/)
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+})
+
 describe("Background Indexing Security Policy (SEC-002)", () => {
   it("enforces --index-only during background indexing even when repository config attempts indexOnly: false", () => {
     const tmpRoot = mkdtempSync(join(tmpdir(), "gitnexus-hooks-sec-"))
@@ -122,7 +162,7 @@ describe("Background Indexing Security Policy (SEC-002)", () => {
         env: {},
       })
       assert.equal(cfg.indexOnly, true)
-      assert.equal(cfg.allowNpxFallback, false)
+      assert.equal("allowNpxFallback" in cfg, false)
 
       let capturedArgs: string[] = []
       const state = createAnalyzeState((targetRepo, passedCfg, onDone) => {

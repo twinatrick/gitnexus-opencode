@@ -13,7 +13,7 @@ const alwaysSubagent = () => false
 describe("createSystemTransformHandler", () => {
   it("pushes the FULL addendum for a known main session", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
     })
     const out = { system: ["base prompt", "AGENTS.md content"] }
@@ -24,7 +24,7 @@ describe("createSystemTransformHandler", () => {
 
   it("pushes the LITE addendum for a known subagent session", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysSubagent,
     })
     const out = { system: ["base"] }
@@ -35,7 +35,7 @@ describe("createSystemTransformHandler", () => {
 
   it("falls back to FULL addendum when sessionID is missing (conservative default)", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: () => {
         throw new Error("isMain must not be called when sessionID is absent")
       },
@@ -46,9 +46,9 @@ describe("createSystemTransformHandler", () => {
     assert.equal(out.system[0], STATIC_SYSTEM_ADDENDUM)
   })
 
-  it("does NOT push when plugin is disabled (CLI unavailable)", async () => {
+  it("does NOT push when neither CLI nor an index is available (COMP-002)", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => true,
+      shouldInject: () => false,
       isMain: alwaysMain,
     })
     const out = { system: ["base"] }
@@ -56,9 +56,9 @@ describe("createSystemTransformHandler", () => {
     assert.deepEqual(out.system, ["base"])
   })
 
-  it("STILL pushes when no repos are locally indexed — agent can use gitnexus_list_repos for global discovery", async () => {
+  it("STILL pushes while the CLI is usable even when no repo is indexed yet", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
     })
     const out = { system: ["base"] }
@@ -69,7 +69,7 @@ describe("createSystemTransformHandler", () => {
 
   it("is idempotent: a second call against the same array does not double-push", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
     })
     const out = { system: ["base"] }
@@ -80,7 +80,7 @@ describe("createSystemTransformHandler", () => {
 
   it("idempotency works across full/lite variants — a pre-existing lite blocks a full push", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
     })
     const out = { system: ["base", STATIC_SYSTEM_ADDENDUM_SUBAGENT] }
@@ -90,7 +90,7 @@ describe("createSystemTransformHandler", () => {
 
   it("respects pre-existing FULL addendum on a subagent call (does not push lite as duplicate)", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysSubagent,
     })
     const out = { system: ["base", STATIC_SYSTEM_ADDENDUM] }
@@ -100,7 +100,7 @@ describe("createSystemTransformHandler", () => {
 
   it("byte-identity preserved across calls of the same variant", async () => {
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
     })
     const a = { system: [] as string[] }
@@ -114,7 +114,7 @@ describe("createSystemTransformHandler", () => {
   it("logs include the variant tag", async () => {
     const logs: Array<{ msg: string; level?: string }> = []
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysSubagent,
       log: (msg, level) => logs.push({ msg, level }),
     })
@@ -128,7 +128,7 @@ describe("createSystemTransformHandler", () => {
   it("logs full variant when main", async () => {
     const logs: Array<{ msg: string; level?: string }> = []
     const handle = createSystemTransformHandler({
-      disabled: () => false,
+      shouldInject: () => true,
       isMain: alwaysMain,
       log: (msg, level) => logs.push({ msg, level }),
     })
@@ -139,7 +139,7 @@ describe("createSystemTransformHandler", () => {
   it("does not log when it skips", async () => {
     const logs: Array<{ msg: string; level?: string }> = []
     const handle = createSystemTransformHandler({
-      disabled: () => true,
+      shouldInject: () => false,
       isMain: alwaysMain,
       log: (msg, level) => logs.push({ msg, level }),
     })

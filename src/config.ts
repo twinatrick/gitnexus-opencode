@@ -9,9 +9,7 @@ export interface PluginConfig {
   autoIndex: boolean;
   autoRefreshStale: boolean;
   autoRefreshOnCommit: boolean;
-  gitnexusVersion: string;
   HintTools: string[];
-  allowNpxFallback: boolean;
   indexOnly: boolean;
 }
 
@@ -41,11 +39,16 @@ const DEFAULTS: PluginConfig = {
   autoIndex: true,
   autoRefreshStale: true,
   autoRefreshOnCommit: true,
-  gitnexusVersion: MIN_SUPPORTED_GITNEXUS_VERSION,
   HintTools: ["grep", "glob", "read", "bash"],
-  allowNpxFallback: false,
   indexOnly: true,
 };
+
+/**
+ * SEC-004: `allowNpxFallback` and `gitnexusVersion` used to control an npm/npx
+ * download path. The plugin now never invokes a package manager, so these keys
+ * are ignored in both user-level and repository-level config.
+ */
+const LEGACY_PACKAGE_KEYS = ["allowNpxFallback", "gitnexusVersion"] as const;
 
 const STRICT_SEMVER_RE =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
@@ -133,60 +136,54 @@ export function isVersionSupported(
   return compareSemVer(parsedVersion, parsedMin) >= 0;
 }
 
+function resolveConfigPaths(worktree?: string, options?: LoadConfigOptions) {
+  return {
+    globalPath:
+      options?.globalConfigPath ??
+      join(homedir(), ".config", "opencode", "gitnexus-opencode.json"),
+    projectPath: worktree ? join(worktree, ".opencode", "gitnexus-opencode.json") : null,
+  };
+}
+
+export interface DeprecatedConfigWarning {
+  scope: "user" | "repository";
+  keys: string[];
+}
+
 /**
- * Validates that a version string is a canonical SemVer >= MIN_SUPPORTED_GITNEXUS_VERSION
- * and rejects untrusted package sources (npm aliases, Git URLs, file URLs, tarball URLs,
- * path traversal, registry flags, or whitespace injection).
+ * SEC-004: Reports legacy package-execution keys so the plugin can warn once at
+ * startup. The keys are never honored — the plugin has no npm/npx code path.
  */
-export function isValidGitnexusVersion(version: unknown): version is string {
-  if (typeof version !== "string") return false;
-  if (version !== version.trim() || version.length === 0) return false;
-  const lower = version.toLowerCase();
-  if (
-    lower.startsWith("npm:") ||
-    lower.startsWith("git+") ||
-    lower.startsWith("git:") ||
-    lower.startsWith("github:") ||
-    lower.startsWith("file:") ||
-    lower.startsWith("http:") ||
-    lower.startsWith("https:") ||
-    lower.includes("://") ||
-    lower.includes("/") ||
-    lower.includes("\\") ||
-    lower.includes("..") ||
-    lower.includes("@") ||
-    lower.includes("--") ||
-    /\s/.test(version) ||
-    lower.endsWith(".tgz") ||
-    lower.endsWith(".tar.gz")
-  ) {
-    return false;
+export function getDeprecatedConfigKeys(
+  worktree?: string,
+  options?: LoadConfigOptions,
+): DeprecatedConfigWarning[] {
+  const { globalPath, projectPath } = resolveConfigPaths(worktree, options);
+  const warnings: DeprecatedConfigWarning[] = [];
+
+  const globalCfg = readJsonSafe(globalPath) ?? {};
+  const globalKeys = LEGACY_PACKAGE_KEYS.filter((key) => key in globalCfg);
+  if (globalKeys.length > 0) {
+    warnings.push({ scope: "user", keys: [...globalKeys] });
   }
-  if (!STRICT_SEMVER_RE.test(version)) return false;
-  return isVersionSupported(version, MIN_SUPPORTED_GITNEXUS_VERSION);
+
+  if (projectPath) {
+    const projectCfg = readJsonSafe(projectPath) ?? {};
+    const projectKeys = LEGACY_PACKAGE_KEYS.filter((key) => key in projectCfg);
+    if (projectKeys.length > 0) {
+      warnings.push({ scope: "repository", keys: [...projectKeys] });
+    }
+  }
+
+  return warnings;
 }
 
 export function loadConfig(worktree?: string, options?: LoadConfigOptions): PluginConfig {
-  const env = options?.env ?? process.env;
-  const globalPath =
-    options?.globalConfigPath ?? join(homedir(), ".config", "opencode", "gitnexus-opencode.json");
-  const projectPath = worktree ? join(worktree, ".opencode", "gitnexus-opencode.json") : null;
+  const { globalPath, projectPath } = resolveConfigPaths(worktree, options);
 
   const globalCfg = readJsonSafe(globalPath) ?? {};
   const projectCfg = projectPath ? (readJsonSafe(projectPath) ?? {}) : {};
   const mergedNonSecurity = { ...globalCfg, ...projectCfg };
-
-  // SEC-001: allowNpxFallback and gitnexusVersion are strictly user-level security settings.
-  // Untrusted repository configs (.opencode/gitnexus-opencode.json) must never control
-  // package execution sources or enable npx network downloads.
-  const allowNpxFallback =
-    typeof globalCfg.allowNpxFallback === "boolean"
-      ? globalCfg.allowNpxFallback
-      : env.GITNEXUS_ALLOW_NPX_FALLBACK === "1";
-
-  const gitnexusVersion = isValidGitnexusVersion(globalCfg.gitnexusVersion)
-    ? globalCfg.gitnexusVersion
-    : DEFAULTS.gitnexusVersion;
 
   // SEC-002: indexOnly defaults to true and cannot be disabled by repository config.
   // Only user-level config can explicitly opt out (indexOnly: false).
@@ -208,11 +205,9 @@ export function loadConfig(worktree?: string, options?: LoadConfigOptions): Plug
       typeof mergedNonSecurity.autoRefreshOnCommit === "boolean"
         ? mergedNonSecurity.autoRefreshOnCommit
         : DEFAULTS.autoRefreshOnCommit,
-    gitnexusVersion,
     HintTools: Array.isArray(mergedNonSecurity.HintTools)
       ? (mergedNonSecurity.HintTools as unknown[]).filter((t): t is string => typeof t === "string")
       : DEFAULTS.HintTools,
-    allowNpxFallback,
     indexOnly,
   };
 }
@@ -242,25 +237,22 @@ export function resolveLocalGitnexusBin(env: NodeJS.ProcessEnv = process.env): s
   }
 }
 
-export function gitnexusCmd(
-  cfg: Partial<PluginConfig> & Pick<PluginConfig, "gitnexusVersion">,
-  env: NodeJS.ProcessEnv = process.env,
-): string[] {
+/**
+ * SEC-004: Resolves an execution command for the GitNexus CLI.
+ *
+ * The plugin deliberately has no package-manager fallback. It only executes a
+ * local binary, so an untrusted repository cannot influence package sources
+ * through `.npmrc`, `npm_config_*`, or registry settings.
+ */
+export function gitnexusCmd(env: NodeJS.ProcessEnv = process.env): string[] {
   const localBin = resolveLocalGitnexusBin(env);
   if (localBin) {
     return [localBin];
   }
-  if (cfg.allowNpxFallback === true) {
-    if (!isValidGitnexusVersion(cfg.gitnexusVersion)) {
-      throw new Error(
-        `Refusing to execute npx with invalid or unsupported gitnexusVersion "${String(cfg.gitnexusVersion)}". ` +
-          `Expected canonical SemVer >= ${MIN_SUPPORTED_GITNEXUS_VERSION}.`,
-      );
-    }
-    return ["npx", "-y", `gitnexus@${cfg.gitnexusVersion}`];
-  }
   throw new Error(
-    "Local gitnexus binary not found on PATH (or GITNEXUS_BIN), and allowNpxFallback is disabled by security policy.",
+    "Local gitnexus binary not found on PATH (or GITNEXUS_BIN). " +
+      "This plugin never downloads packages via npm/npx. " +
+      `Install gitnexus >= ${MIN_SUPPORTED_GITNEXUS_VERSION} locally, or use an air-gap install and point GITNEXUS_BIN at it.`,
   );
 }
 
@@ -280,13 +272,13 @@ function defaultCliRunner(file: string, args: string[]): string {
 }
 
 /**
- * COMP-001 & SEC-001: Validates local GitNexus CLI availability, SemVer >= MIN_SUPPORTED_GITNEXUS_VERSION,
- * and `--index-only` capability without ever triggering npx network downloads.
+ * COMP-001 & SEC-004: Validates local GitNexus CLI availability, SemVer >= MIN_SUPPORTED_GITNEXUS_VERSION,
+ * and `--index-only` capability. Never invokes a package manager or network download.
  */
-export function checkGitNexusCliCompatibility(
-  _config?: Partial<PluginConfig>,
-  options?: { env?: NodeJS.ProcessEnv; execRunner?: CliRunner },
-): CliCompatibilityResult {
+export function checkGitNexusCliCompatibility(options?: {
+  env?: NodeJS.ProcessEnv;
+  execRunner?: CliRunner;
+}): CliCompatibilityResult {
   const env = options?.env ?? process.env;
   const runner = options?.execRunner ?? defaultCliRunner;
 
@@ -298,7 +290,7 @@ export function checkGitNexusCliCompatibility(
       version: null,
       supportsIndexOnly: false,
       reason:
-        "Local gitnexus CLI binary not found. Automatic network download (npx) is disabled during CLI check.",
+        "Local gitnexus CLI binary not found. This plugin never downloads packages; install gitnexus locally or set GITNEXUS_BIN.",
     };
   }
 

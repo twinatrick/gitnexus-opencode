@@ -99,7 +99,7 @@ function analyzeInBackground(
   config: PluginConfig,
   onDone: () => void,
 ) {
-  const cmd = gitnexusCmd(config)
+  const cmd = gitnexusCmd()
   const analyzeArgs = buildAnalyzeArgs(repoPath, config)
   const devNull = openSync("/dev/null", "w")
   let child
@@ -135,26 +135,25 @@ function analyzeInBackground(
 export interface ToolHooksDeps {
   cwd: string
   config: PluginConfig
-  disabled: () => boolean
+  /** COMP-002: Whether CLI-backed actions (analyze/refresh) can run. */
+  canAnalyze: () => boolean
   analyzeState: AnalyzeState
   hintState: HintEnvelopeState
 }
 
 export function createToolHooks(deps: ToolHooksDeps) {
-  const { cwd, config, disabled, analyzeState, hintState } = deps
+  const { cwd, config, canAnalyze, analyzeState, hintState } = deps
   return {
     onToolExecuteAfter(
       input: { tool: string; args: any },
       output: { output: string },
     ) {
-      if (disabled()) return
-
       if (input.tool === "skill") {
         const name = input.args?.name as string | undefined
         if (!name) return
 
         if (name === "init-deep" || name === "init") {
-          output.output += INIT_PREREQUISITE
+          if (canAnalyze()) output.output += INIT_PREREQUISITE
           return
         }
 
@@ -168,6 +167,7 @@ export function createToolHooks(deps: ToolHooksDeps) {
       }
 
       if (input.tool === "bash" && config.autoRefreshOnCommit) {
+        if (!canAnalyze()) return
         const cmd = input.args?.command as string | undefined
         if (!cmd || !GIT_MUTATION_RE.test(cmd)) return
 
@@ -357,13 +357,18 @@ export function createMessagesTransformHandler(deps: MessagesTransformDeps) {
 }
 
 export interface SystemTransformDeps {
-  disabled: () => boolean
+  /**
+   * COMP-002: Injects when the CLI is usable OR a pre-existing index can still
+   * supply graph context. Only a completely unusable state (no CLI, no index)
+   * suppresses injection.
+   */
+  shouldInject: () => boolean
   isMain: (sessionID: string) => boolean
   log?: (message: string, level?: "debug" | "info" | "warn" | "error") => void
 }
 
 export function createSystemTransformHandler(deps: SystemTransformDeps) {
-  const { disabled, isMain } = deps
+  const { shouldInject, isMain } = deps
   const log = deps.log ?? (() => {})
 
   return async function handle(
@@ -371,7 +376,7 @@ export function createSystemTransformHandler(deps: SystemTransformDeps) {
     output: { system: string[] },
   ): Promise<void> {
     try {
-      if (disabled()) return
+      if (!shouldInject()) return
       if (systemAddendumPresent(output.system)) return
       const sessionIsKnownSubagent =
         !!input.sessionID && !isMain(input.sessionID)
