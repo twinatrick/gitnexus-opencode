@@ -1,6 +1,12 @@
 import { execFileSync } from "node:child_process"
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
-import { loadConfig, gitnexusCmd } from "./config.js"
+import {
+  loadConfig,
+  gitnexusCmd,
+  buildAnalyzeArgs,
+  checkGitNexusCliCompatibility,
+  type CliRunner,
+} from "./config.js"
 import { discoverRepos } from "./discovery.js"
 import { buildUserToast } from "./context.js"
 import {
@@ -13,21 +19,13 @@ import { createHintEnvelopeState } from "./hint-envelope.js"
 import { createLastInjectedRegistry } from "./last-injected.js"
 import { createSessionRegistry, type SessionRegistry } from "./sessions.js"
 
-
 const TOAST_DELAY_MS = 6000 // heuristic: waits past oh-my-openagent spinner animation
 
-function isGitNexusCliAvailable(config: ReturnType<typeof loadConfig>): boolean {
-  const cmd = gitnexusCmd(config)
-  try {
-    execFileSync(cmd[0], [...cmd.slice(1), "--version"], {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-    return true
-  } catch {
-    return false
-  }
+export function isGitNexusCliAvailable(
+  config: ReturnType<typeof loadConfig>,
+  options?: { env?: NodeJS.ProcessEnv; execRunner?: CliRunner },
+): boolean {
+  return checkGitNexusCliCompatibility(config, options).compatible
 }
 
 async function hydrateSubagentRegistry(
@@ -101,8 +99,6 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
     log,
   })
 
-  const cmd = gitnexusCmd(config)
-
   const tools = {
     gitnexus_analyze: tool({
       description:
@@ -114,11 +110,18 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
       async execute(args) {
         const repoPath = args.path || scanRoot
         try {
-          const analyzeArgs = config.indexOnly ? ["analyze", "--index-only", repoPath] : ["analyze", repoPath]
+          const cmd = gitnexusCmd(config)
+          if (cmd[0] !== "npx") {
+            const compat = checkGitNexusCliCompatibility(config)
+            if (!compat.compatible) {
+              return `Failed to build graph: ${compat.reason ?? "Incompatible GitNexus CLI"}`
+            }
+          }
+          const analyzeArgs = buildAnalyzeArgs(repoPath, config)
           const result = execFileSync(
             cmd[0],
             [...cmd.slice(1), ...analyzeArgs],
-            { encoding: "utf-8", timeout: 300000, cwd: repoPath }
+            { encoding: "utf-8", timeout: 300000, cwd: repoPath },
           )
           return `Graph built successfully for ${repoPath}.\n${result}`
         } catch (err) {
@@ -149,9 +152,12 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
         const sessionID = info?.id
         if (info?.id) sessions.trackCreated({ id: info.id, parentID: info.parentID })
 
-        if (!isGitNexusCliAvailable(config)) {
-          const cmdStr = gitnexusCmd(config).join(" ")
-          log(`CLI not available (${cmdStr} --version failed). Plugin disabled for this session.`, "warn")
+        const compat = checkGitNexusCliCompatibility(config)
+        if (!compat.compatible) {
+          log(
+            `CLI not available or incompatible (${compat.reason ?? "version check failed"}). Plugin disabled for this session.`,
+            "warn",
+          )
           disabled = true
           return
         }

@@ -1,21 +1,41 @@
+import { discoverRepos, type RepoInfo } from "./discovery.js"
 
-function sanitizeXmlAttr(val: unknown): string {
-  return String(val ?? "")
-    .replace(/[\x00-\x1F\x7F]/g, "")
+/**
+ * Input validation + XML 1.0 control character sanitization for text nodes.
+ * Normalizes CRLF/CR line endings to LF and strips disallowed XML 1.0 control
+ * characters (U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+0084, U+0086-U+009F)
+ * while preserving valid horizontal tab (\t) and line feed (\n).
+ */
+export function sanitizeXmlText(val: unknown): string {
+  const validated = typeof val === "string" ? val : String(val ?? "")
+  return validated
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F]/g, "")
+}
+
+/**
+ * Input validation + XML 1.0 control character sanitization for XML attributes.
+ * Normalizes embedded newlines/tabs to spaces and strips all C0/DEL/C1 control characters.
+ */
+export function sanitizeXmlAttr(val: unknown): string {
+  const validated = typeof val === "string" ? val : String(val ?? "")
+  return validated
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[\x00-\x1F\x7F-\x84\x86-\x9F]/g, "")
+}
+
+/**
+ * Encodes XML special characters (&, <, >, ", ').
+ * Must be applied AFTER control character sanitization.
+ */
+export function escapeXml(value: string): string {
+  return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+    .replace(/'/g, "&apos;")
 }
-
-function sanitizeXmlText(val: unknown): string {
-  return String(val ?? "")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-    .replace(/<\/?gitnexus_graph[^>]*>/gi, "[stripped-envelope-tag]");
-}
-
-import { discoverRepos, type RepoInfo } from "./discovery.js"
 
 /**
  * State of the cached graph hint envelope.
@@ -171,15 +191,6 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;")
-}
-
 function freshnessSummary(freshness: GraphFreshness): string {
   switch (freshness) {
     case "up_to_date":
@@ -193,16 +204,31 @@ function freshnessSummary(freshness: GraphFreshness): string {
   }
 }
 
+/**
+ * Follows the SEC-003 processing order:
+ * Untrusted Input -> Input Validation -> Control Character Sanitization -> XML Escaping -> XML Envelope Generation
+ */
 function buildEnvelope(indexed: RepoInfo[], freshness: GraphFreshness): string {
+  const safeFreshness = escapeXml(sanitizeXmlAttr(freshness))
+  const safeSummary = escapeXml(sanitizeXmlText(freshnessSummary(freshness)))
+  const safeRules = escapeXml(
+    sanitizeXmlText(
+      `See the GitNexus section of the system prompt for tool preference and subagent propagation rules (marker ${OPT_IN_MARKER}).`,
+    ),
+  )
   const repoLines = indexed
-    .map((r) => `<repo name="${escapeXml(r.name)}" path="${escapeXml(r.path)}"/>`)
+    .map((r) => {
+      const safeName = escapeXml(sanitizeXmlAttr(r.name))
+      const safePath = escapeXml(sanitizeXmlAttr(r.path))
+      return `<repo name="${safeName}" path="${safePath}"/>`
+    })
     .join("\n")
 
-  return `<gitnexus_graph source="gitnexus" version="2" freshness="${freshness}">
-<summary>${escapeXml(freshnessSummary(freshness))}</summary>
+  return `<gitnexus_graph source="gitnexus" version="2" freshness="${safeFreshness}">
+<summary>${safeSummary}</summary>
 <indexed_repos scope="cwd-tree" note="repos under the current directory tree only; more may be indexed machine-wide (gitnexus_list_repos)">
 ${repoLines}
 </indexed_repos>
-<rules>See the GitNexus section of the system prompt for tool preference and subagent propagation rules (marker ${OPT_IN_MARKER}).</rules>
+<rules>${safeRules}</rules>
 </gitnexus_graph>`
 }

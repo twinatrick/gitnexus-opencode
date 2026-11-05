@@ -1,5 +1,8 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 // Inlined copy of the production regex from src/hooks.ts.
 // Keep in sync if the regex is updated there.
@@ -48,7 +51,9 @@ describe("GIT_MUTATION_RE", () => {
 // actually runs `git rev-parse`, so these tests rely on the gitnexus-opencode
 // repo root itself (the test runs from the package directory).
 // -----------------------------------------------------------------------
-import { extractGitDashCPath } from "../src/hooks.js"
+import { extractGitDashCPath, createAnalyzeState } from "../src/hooks.js"
+import { loadConfig, buildAnalyzeArgs } from "../src/config.js"
+import { createHintEnvelopeState } from "../src/hint-envelope.js"
 import { execFileSync } from "node:child_process"
 
 const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
@@ -73,9 +78,6 @@ describe("extractGitDashCPath", () => {
   })
 
   it("handles quoted paths with spaces (no spaces in our test repo, but parser must accept)", () => {
-    // Parser should accept the quoted form even if the target does not exist.
-    // The result is null because the parsed target is not a real repo, but
-    // the important assertion is that parsing did not throw.
     assert.doesNotThrow(() =>
       extractGitDashCPath('git -C "/some/other path" commit', "/tmp"),
     )
@@ -89,8 +91,6 @@ describe("extractGitDashCPath", () => {
   })
 
   it("resolves relative paths against cwd", () => {
-    // Running the test from REPO_ROOT itself, `.` relative to cwd=REPO_ROOT
-    // still resolves to REPO_ROOT (findGitRoot walks up).
     assert.equal(
       extractGitDashCPath("git -C . commit", REPO_ROOT),
       REPO_ROOT,
@@ -102,7 +102,40 @@ describe("extractGitDashCPath", () => {
   })
 
   it("returns null when -C is followed by nothing parseable", () => {
-    // `git -C` with no target after it -> match fails, returns null.
     assert.equal(extractGitDashCPath("git -C", REPO_ROOT), null)
+  })
+})
+
+describe("Background Indexing Security Policy (SEC-002)", () => {
+  it("enforces --index-only during background indexing even when repository config attempts indexOnly: false", () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), "gitnexus-hooks-sec-"))
+    try {
+      const repoDir = join(tmpRoot, "repo")
+      mkdirSync(join(repoDir, ".opencode"), { recursive: true })
+      writeFileSync(
+        join(repoDir, ".opencode", "gitnexus-opencode.json"),
+        JSON.stringify({ indexOnly: false, allowNpxFallback: true }),
+      )
+
+      const cfg = loadConfig(repoDir, {
+        globalConfigPath: join(tmpRoot, "nonexistent-global.json"),
+        env: {},
+      })
+      assert.equal(cfg.indexOnly, true)
+      assert.equal(cfg.allowNpxFallback, false)
+
+      let capturedArgs: string[] = []
+      const state = createAnalyzeState((targetRepo, passedCfg, onDone) => {
+        capturedArgs = buildAnalyzeArgs(targetRepo, passedCfg)
+        onDone()
+      })
+      const hintState = createHintEnvelopeState()
+
+      const scheduled = state.schedule(repoDir, cfg, repoDir, hintState)
+      assert.equal(scheduled, true)
+      assert.deepEqual(capturedArgs, ["analyze", "--index-only", repoDir])
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true })
+    }
   })
 })

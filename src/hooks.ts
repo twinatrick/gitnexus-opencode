@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process"
 import { closeSync, existsSync, openSync } from "fs"
 import { join } from "path"
-import { gitnexusCmd, type PluginConfig } from "./config.js"
+import { buildAnalyzeArgs, gitnexusCmd, type PluginConfig } from "./config.js"
 import { hasIndex } from "./staleness.js"
 import { discoverRepos } from "./discovery.js"
 import {
@@ -35,6 +35,12 @@ After analyze completes, use gitnexus_query/context/cypher instead of spawning
 explore agents for codebase understanding.
 Only spawn explore agents for: conventions, anti-patterns, CI/build.`
 
+export type BackgroundAnalyzeSpawner = (
+  repoPath: string,
+  config: PluginConfig,
+  onDone: () => void,
+) => void
+
 /**
  * Per-plugin-instance analyze state: the set of repos that currently have a
  * background analyze in flight. Each call to createAnalyzeState() returns its
@@ -52,7 +58,9 @@ export interface AnalyzeState {
   reset(): void
 }
 
-export function createAnalyzeState(): AnalyzeState {
+export function createAnalyzeState(
+  spawner: BackgroundAnalyzeSpawner = analyzeInBackground,
+): AnalyzeState {
   const inFlight = new Set<string>()
 
   return {
@@ -70,10 +78,10 @@ export function createAnalyzeState(): AnalyzeState {
       }
 
       try {
-        analyzeInBackground(repoPath, config, cleanup)
+        spawner(repoPath, config, cleanup)
         return true
       } catch {
-        // spawn() threw synchronously (e.g. openSync EACCES, invalid argv).
+        // spawn() threw synchronously (e.g. openSync EACCES, invalid argv, missing binary).
         // Without this cleanup the repo would be stuck in the `refreshing`
         // state and future schedule calls would short-circuit on inFlight.
         cleanup()
@@ -92,7 +100,7 @@ function analyzeInBackground(
   onDone: () => void,
 ) {
   const cmd = gitnexusCmd(config)
-  const analyzeArgs = config.indexOnly ? ["analyze", "--index-only", repoPath] : ["analyze", repoPath]
+  const analyzeArgs = buildAnalyzeArgs(repoPath, config)
   const devNull = openSync("/dev/null", "w")
   let child
   try {
