@@ -28,7 +28,7 @@ OpenCode plugin for [GitNexus](https://github.com/nicepkg/gitnexus) — automati
 |------|---------|--------|
 | `tool.execute.after` on `skill` | Skill loaded | Inject graph prerequisite for `init-deep`/`init`, availability hint for others |
 | `tool.execute.after` on `bash` | Git mutation detected | Background re-index (cache flips to `freshness=refreshing`, then back to `up_to_date`) |
-| `experimental.chat.system.transform` | Every LLM call | Push the static GitNexus rule block onto `output.system` (idempotent; skipped if plugin disabled or already present) |
+| `experimental.chat.system.transform` | Every LLM call | Push the static GitNexus rule block onto `output.system` (idempotent; skipped only when no CLI is available **and** no repo is indexed) |
 | `experimental.chat.messages.transform` | Every LLM call | Prepend the dynamic graph envelope to the last user message of eligible sessions (main sessions automatically; subagents only if the orchestrator added the `[[gitnexus:graph]]` marker). Skips injection when the envelope is byte-identical to the last one injected into this session (per-session dedup). |
 
 ## Two-layer hint architecture
@@ -53,19 +53,40 @@ Splitting puts the **rules** in the highest-salience location for instruction-fo
 
 ## Install
 
-Build and deploy:
+### Execution Modes
+
+| Mode | Network Required | Description |
+| --- | --- | --- |
+| **1. Local Binary Mode (Default)** | No | Resolves `GITNEXUS_BIN` or the local `gitnexus` binary on `PATH` (minimum supported version: `>= 1.6.12` with `--index-only` support). Fails safely if missing. |
+| **2. Air-Gap Mode** | No | Pre-install `gitnexus` (`>= 1.6.12`) from an offline tarball/image or set `GITNEXUS_BIN` to the offline executable. Session checks (`--version` / `analyze --help`) and indexing never trigger network downloads. |
+
+> **Invariant (SEC-004):** This plugin never invokes `npm`, `npx`, `pnpm`, `yarn`, or `bunx`, and it never downloads package code at runtime. It executes only the local binary resolved from `GITNEXUS_BIN` or `PATH`. A repository-level `.npmrc`, `package.json`, or legacy `allowNpxFallback` / `gitnexusVersion` key cannot change the package source or turn on a download path.
+
+### Prerequisite: Install Local GitNexus CLI (`>= 1.6.12`)
+
+```bash
+# Standard local installation
+npm install -g gitnexus@1.6.12
+
+# Or in an offline / air-gapped environment
+npm install -g ./gitnexus-1.6.12.tgz --offline
+
+gitnexus --version
+```
+
+Build and deploy the plugin:
 ```bash
 npm install && npm run build
 cp dist/gitnexus-opencode.js ~/.config/opencode/plugins/
 ```
 
-Ensure GitNexus MCP is configured in `~/.config/opencode/config.json`:
+Configure GitNexus MCP in `~/.config/opencode/opencode.json` using the local binary:
 ```json
 {
   "mcp": {
     "gitnexus": {
       "type": "local",
-      "command": ["npx", "-y", "gitnexus@1.6.5", "mcp"]
+      "command": ["gitnexus", "mcp"]
     }
   }
 }
@@ -93,21 +114,23 @@ For full step-by-step installation guide (intended for AI agents), see [INSTALL.
 
 ## Configuration
 
-Create `.opencode/gitnexus-opencode.json` (project) or `~/.config/opencode/gitnexus-opencode.json` (global):
+The plugin enforces a strict **zero-trust boundary** between user-level config (`~/.config/opencode/gitnexus-opencode.json`) and repository-level config (`<repo>/.opencode/gitnexus-opencode.json`):
 
 ```json
 {
-  "gitnexusVersion": "1.6.5",
   "autoRefreshStale": true,
-  "autoRefreshOnCommit": true
+  "autoRefreshOnCommit": true,
+  "indexOnly": true
 }
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `gitnexusVersion` | `"1.6.5"` | Pin the gitnexus npm version |
-| `autoRefreshStale` | `true` | Refresh stale indexes on session start |
-| `autoRefreshOnCommit` | `true` | Refresh after git commit/merge/rebase |
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `autoRefreshStale` | `true` | User or Repo | Refresh stale indexes on session start |
+| `autoRefreshOnCommit` | `true` | User or Repo | Refresh after git commit/merge/rebase |
+| `indexOnly` | `true` | **User-level only** (Repo cannot set `false`) | Pass `--index-only` to `gitnexus analyze` so repository files (`AGENTS.md`, `CLAUDE.md`, `.claude/skills/`) are never modified unless explicitly authorized by user config |
+
+Legacy keys `allowNpxFallback` and `gitnexusVersion` are ignored in both user and repository config. When present, the plugin logs one warning and continues with local-binary-only execution.
 
 ## Build
 
@@ -127,8 +150,10 @@ The static rule block is delivered through `experimental.chat.system.transform`.
 - **Lite** for sessions positively identified as subagents via the `SessionRegistry`
 
 Skipped if:
-- the plugin is disabled (CLI unreachable), or
+- no GitNexus CLI is available **and** the workspace has no indexed repo (nothing the addendum could act on; COMP-002), or
 - any gitnexus addendum is already present in the array (idempotency, detected via the start sentinel — works across both variants).
+
+A missing CLI never disables the plugin. Existing graph envelopes and `gitnexus_*` MCP tools keep working; only `gitnexus_analyze` and background re-indexing report the missing local binary.
 
 Both variants are wrapped between the same sentinels `<!-- gitnexus:system:start -->` and `<!-- gitnexus:system:end -->`. Neither variant contains per-instance interpolations, so each is byte-identical between turns and across sessions — provider prefix caches match and the cached-input price applies after the first turn.
 

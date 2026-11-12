@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process"
 import { closeSync, existsSync, openSync } from "fs"
 import { join } from "path"
-import { gitnexusCmd, type PluginConfig } from "./config.js"
+import { buildAnalyzeArgs, gitnexusCmd, type PluginConfig } from "./config.js"
 import { hasIndex } from "./staleness.js"
 import { discoverRepos } from "./discovery.js"
 import {
@@ -35,6 +35,12 @@ After analyze completes, use gitnexus_query/context/cypher instead of spawning
 explore agents for codebase understanding.
 Only spawn explore agents for: conventions, anti-patterns, CI/build.`
 
+export type BackgroundAnalyzeSpawner = (
+  repoPath: string,
+  config: PluginConfig,
+  onDone: () => void,
+) => void
+
 /**
  * Per-plugin-instance analyze state: the set of repos that currently have a
  * background analyze in flight. Each call to createAnalyzeState() returns its
@@ -52,7 +58,9 @@ export interface AnalyzeState {
   reset(): void
 }
 
-export function createAnalyzeState(): AnalyzeState {
+export function createAnalyzeState(
+  spawner: BackgroundAnalyzeSpawner = analyzeInBackground,
+): AnalyzeState {
   const inFlight = new Set<string>()
 
   return {
@@ -70,10 +78,10 @@ export function createAnalyzeState(): AnalyzeState {
       }
 
       try {
-        analyzeInBackground(repoPath, config, cleanup)
+        spawner(repoPath, config, cleanup)
         return true
       } catch {
-        // spawn() threw synchronously (e.g. openSync EACCES, invalid argv).
+        // spawn() threw synchronously (e.g. openSync EACCES, invalid argv, missing binary).
         // Without this cleanup the repo would be stuck in the `refreshing`
         // state and future schedule calls would short-circuit on inFlight.
         cleanup()
@@ -91,11 +99,12 @@ function analyzeInBackground(
   config: PluginConfig,
   onDone: () => void,
 ) {
-  const cmd = gitnexusCmd(config)
+  const cmd = gitnexusCmd()
+  const analyzeArgs = buildAnalyzeArgs(repoPath, config)
   const devNull = openSync("/dev/null", "w")
   let child
   try {
-    child = spawn(cmd[0], [...cmd.slice(1), "analyze", repoPath], {
+    child = spawn(cmd[0], [...cmd.slice(1), ...analyzeArgs], {
       stdio: ["ignore", devNull, devNull],
       detached: true,
       cwd: repoPath,
@@ -126,26 +135,25 @@ function analyzeInBackground(
 export interface ToolHooksDeps {
   cwd: string
   config: PluginConfig
-  disabled: () => boolean
+  /** COMP-002: Whether CLI-backed actions (analyze/refresh) can run. */
+  canAnalyze: () => boolean
   analyzeState: AnalyzeState
   hintState: HintEnvelopeState
 }
 
 export function createToolHooks(deps: ToolHooksDeps) {
-  const { cwd, config, disabled, analyzeState, hintState } = deps
+  const { cwd, config, canAnalyze, analyzeState, hintState } = deps
   return {
     onToolExecuteAfter(
       input: { tool: string; args: any },
       output: { output: string },
     ) {
-      if (disabled()) return
-
       if (input.tool === "skill") {
         const name = input.args?.name as string | undefined
         if (!name) return
 
         if (name === "init-deep" || name === "init") {
-          output.output += INIT_PREREQUISITE
+          if (canAnalyze()) output.output += INIT_PREREQUISITE
           return
         }
 
@@ -159,6 +167,7 @@ export function createToolHooks(deps: ToolHooksDeps) {
       }
 
       if (input.tool === "bash" && config.autoRefreshOnCommit) {
+        if (!canAnalyze()) return
         const cmd = input.args?.command as string | undefined
         if (!cmd || !GIT_MUTATION_RE.test(cmd)) return
 
@@ -348,13 +357,18 @@ export function createMessagesTransformHandler(deps: MessagesTransformDeps) {
 }
 
 export interface SystemTransformDeps {
-  disabled: () => boolean
+  /**
+   * COMP-002: Injects when the CLI is usable OR a pre-existing index can still
+   * supply graph context. Only a completely unusable state (no CLI, no index)
+   * suppresses injection.
+   */
+  shouldInject: () => boolean
   isMain: (sessionID: string) => boolean
   log?: (message: string, level?: "debug" | "info" | "warn" | "error") => void
 }
 
 export function createSystemTransformHandler(deps: SystemTransformDeps) {
-  const { disabled, isMain } = deps
+  const { shouldInject, isMain } = deps
   const log = deps.log ?? (() => {})
 
   return async function handle(
@@ -362,7 +376,7 @@ export function createSystemTransformHandler(deps: SystemTransformDeps) {
     output: { system: string[] },
   ): Promise<void> {
     try {
-      if (disabled()) return
+      if (!shouldInject()) return
       if (systemAddendumPresent(output.system)) return
       const sessionIsKnownSubagent =
         !!input.sessionID && !isMain(input.sessionID)
