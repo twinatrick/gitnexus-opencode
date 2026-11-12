@@ -431,4 +431,94 @@ describe("createMessagesTransformHandler", () => {
     // assistant message untouched
     assert.equal((out.messages[1]!.parts[0] as { text: string }).text, "assistant reply")
   })
+
+  describe("SEC-006: fail-closed subagent & unknown session authorization", () => {
+    it("unknown session without marker is denied (fail-closed)", async () => {
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "unknown",
+        getCache: () => makeCache(),
+      })
+      const out = makeOutput({ text: "hello from unclassified session", sessionID: "ses_unknown" })
+      await handle({}, out)
+      assert.equal(
+        (out.messages[0]!.parts[0] as { text: string }).text,
+        "hello from unclassified session",
+      )
+    })
+
+    it("unknown session even WITH marker is denied until classified", async () => {
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "unknown",
+        getCache: () => makeCache(),
+      })
+      const out = makeOutput({
+        text: `${OPT_IN_MARKER} attempt from unclassified session`,
+        sessionID: "ses_unknown_marker",
+      })
+      await handle({}, out)
+      assert.equal(
+        (out.messages[0]!.parts[0] as { text: string }).text,
+        `${OPT_IN_MARKER} attempt from unclassified session`,
+      )
+    })
+
+    it("known main session automatically receives the graph envelope", async () => {
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "main",
+        getCache: () => makeCache(),
+      })
+      const out = makeOutput({ text: "hello from main", sessionID: "ses_main" })
+      await handle({}, out)
+      assert.match((out.messages[0]!.parts[0] as { text: string }).text, /^<gitnexus_graph/)
+    })
+
+    it("known subagent without marker is denied", async () => {
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "subagent",
+        getCache: () => makeCache(),
+      })
+      const out = makeOutput({ text: "subagent without marker", sessionID: "ses_sub" })
+      await handle({}, out)
+      assert.equal((out.messages[0]!.parts[0] as { text: string }).text, "subagent without marker")
+    })
+
+    it("known subagent WITH marker receives the graph envelope and has marker stripped", async () => {
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "subagent",
+        getCache: () => makeCache(),
+      })
+      const out = makeOutput({
+        text: `${OPT_IN_MARKER} subagent with explicit opt-in`,
+        sessionID: "ses_sub_optin",
+      })
+      await handle({}, out)
+      const resultText = (out.messages[0]!.parts[0] as { text: string }).text
+      assert.match(resultText, /^<gitnexus_graph/)
+      assert.match(resultText, /\n\nsubagent with explicit opt-in$/)
+      assert.ok(!resultText.includes(OPT_IN_MARKER))
+    })
+  })
+
+  describe("DATA-001: user prompt content is never written to logs", () => {
+    it("logs textLength instead of textPreview and never leaks prompt secrets", async () => {
+      const logs: Array<{ msg: string; level?: string }> = []
+      const secretPrompt = "sk-live-SUPER-SECRET-API-KEY-9876543210 explain auth flow"
+      const handle = createMessagesTransformHandler({
+        getSessionKind: () => "main",
+        getCache: () => makeCache(),
+        log: (msg, level) => logs.push({ msg, level }),
+      })
+      const out = makeOutput({ text: secretPrompt, sessionID: "ses_privacy" })
+      await handle({}, out)
+
+      assert.equal(logs.length, 1)
+      assert.match(logs[0]!.msg, /messages\.transform injected:/)
+      assert.match(logs[0]!.msg, new RegExp(`textLength=${secretPrompt.length}\\b`))
+      assert.doesNotMatch(logs[0]!.msg, /textPreview=/)
+      assert.ok(
+        !logs[0]!.msg.includes("sk-live") && !logs[0]!.msg.includes("SUPER-SECRET"),
+        "raw user prompt content must never appear in application logs",
+      )
+    })
+  })
 })

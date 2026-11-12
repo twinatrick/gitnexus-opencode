@@ -3,7 +3,6 @@ import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
 import {
   loadConfig,
   getDeprecatedConfigKeys,
-  gitnexusCmd,
   buildAnalyzeArgs,
   checkGitNexusCliCompatibility,
   type CliRunner,
@@ -24,12 +23,13 @@ const TOAST_DELAY_MS = 6000 // heuristic: waits past oh-my-openagent spinner ani
 
 export function isGitNexusCliAvailable(options?: {
   env?: NodeJS.ProcessEnv
+  worktree?: string
   execRunner?: CliRunner
 }): boolean {
   return checkGitNexusCliCompatibility(options).compatible
 }
 
-async function hydrateSubagentRegistry(
+export async function hydrateSubagentRegistry(
   client: PluginInput["client"],
   registry: SessionRegistry,
   log: (message: string, level?: "debug" | "info" | "warn" | "error") => void,
@@ -37,19 +37,20 @@ async function hydrateSubagentRegistry(
   try {
     const result = await client.session.list()
     const sessions = (result as { data?: Array<{ id?: string; parentID?: string }> })?.data ?? []
+    let mainCount = 0
     let subagentCount = 0
     for (const s of sessions) {
-      if (s?.id && s?.parentID) {
-        registry.trackCreated({ id: s.id, parentID: s.parentID })
-        subagentCount++
-      }
+      if (!s?.id) continue
+      registry.trackCreated({ id: s.id, parentID: s.parentID })
+      if (s.parentID) subagentCount++
+      else mainCount++
     }
     log(
-      `Hydrated subagent registry from session.list(): ${subagentCount} subagent(s) of ${sessions.length} session(s)`,
+      `Hydrated session registry from session.list(): ${mainCount} main, ${subagentCount} subagent(s) of ${sessions.length} session(s)`,
     )
   } catch (err) {
     log(
-      `session.list() failed during hydration: ${err instanceof Error ? err.message : String(err)}. Unknown sessions will default to main (safe).`,
+      `session.list() failed during hydration: ${err instanceof Error ? err.message : String(err)}. Unknown sessions remain fail-closed until classified.`,
       "warn",
     )
   }
@@ -59,9 +60,11 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
   const scanRoot = worktree ?? directory
   const config = loadConfig(scanRoot)
 
-  // COMP-002: CLI availability is tracked separately from graph/index state.
-  // A missing CLI must never disable prompt injection for an existing index.
+  // COMP-002 & SEC-005: CLI availability and the validated binary path are
+  // tracked together. A missing CLI never disables prompt injection for an
+  // existing index, and all CLI executions reuse the validated binary path.
   let cliAvailable = false
+  let validatedCliBinary: string | null = null
 
   const log = (message: string, level: "debug" | "info" | "warn" | "error" = "info") => {
     void client.app.log({ body: { service: "gitnexus", level, message } })
@@ -86,22 +89,22 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
   const analyzeState = createAnalyzeState()
   const lastInjected = createLastInjectedRegistry()
 
-  // Hydrate the subagent registry from existing sessions so plugin reloads
-  // and session compactions don't misclassify long-lived subagents as main.
-  // Fire-and-forget: a turn that races this hydration sees the unknown
-  // session default to main, which is the safe (harmless) failure mode.
+  // SEC-006: Hydrate both main and subagent sessions on plugin init. Any
+  // session not yet classified remains "unknown" and fails closed until
+  // hydration or `session.created` classifies it.
   void hydrateSubagentRegistry(client, sessions, log)
 
   const toolHooks = createToolHooks({
     cwd: scanRoot,
     config,
     canAnalyze: () => cliAvailable,
+    getValidatedBinary: () => validatedCliBinary,
     analyzeState,
     hintState,
   })
 
   const messagesTransformHandler = createMessagesTransformHandler({
-    isMain: (sessionID) => sessions.isMain(sessionID),
+    getSessionKind: (sessionID) => sessions.getKind(sessionID),
     getCache: () => hintState.getHintCache(),
     lastInjected,
     log,
@@ -127,15 +130,18 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
       async execute(args) {
         const repoPath = args.path || scanRoot
         try {
-          const compat = checkGitNexusCliCompatibility()
-          if (!compat.compatible) {
+          const compat = checkGitNexusCliCompatibility({ worktree: repoPath })
+          if (!compat.compatible || !compat.binary) {
+            cliAvailable = false
+            validatedCliBinary = null
             return `Failed to build graph: ${compat.reason ?? "Incompatible GitNexus CLI"}`
           }
-          const cmd = gitnexusCmd()
+          cliAvailable = true
+          validatedCliBinary = compat.binary
           const analyzeArgs = buildAnalyzeArgs(repoPath, config)
           const result = execFileSync(
-            cmd[0],
-            [...cmd.slice(1), ...analyzeArgs],
+            compat.binary,
+            analyzeArgs,
             { encoding: "utf-8", timeout: 300000, cwd: repoPath },
           )
           return `Graph built successfully for ${repoPath}.\n${result}`
@@ -173,8 +179,9 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
         hintState.refreshHintCache(scanRoot)
         log(`Discovered ${repos.length} repo(s): ${repos.map((r) => r.name).join(", ") || "none"}`)
 
-        const compat = checkGitNexusCliCompatibility()
+        const compat = checkGitNexusCliCompatibility({ worktree: scanRoot })
         cliAvailable = compat.compatible
+        validatedCliBinary = compat.compatible ? compat.binary : null
 
         if (!compat.compatible) {
           log(
@@ -186,7 +193,7 @@ const plugin: Plugin = async ({ directory, worktree, client }) => {
         } else if (config.autoRefreshStale) {
           for (const repo of repos) {
             if (repo.hasIndex && repo.isStale) {
-              analyzeState.schedule(repo.path, config, scanRoot, hintState)
+              analyzeState.schedule(repo.path, config, scanRoot, hintState, validatedCliBinary)
             }
           }
         }

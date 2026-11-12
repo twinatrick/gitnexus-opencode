@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs"
@@ -64,8 +65,13 @@ describe("SEC-004: repository .npmrc cannot control package sources", () => {
   })
 
   it("returns only the local binary when one is present", () => {
-    const cmd = gitnexusCmd({ GITNEXUS_BIN: "/opt/gitnexus/bin/gitnexus" })
-    assert.deepEqual(cmd, ["/opt/gitnexus/bin/gitnexus"])
+    const binDir = join(tmpRoot, "trusted-bin")
+    mkdirSync(binDir, { recursive: true })
+    const trustedBin = join(binDir, "gitnexus")
+    writeFileSync(trustedBin, "#!/bin/sh\nexit 0\n")
+    chmodSync(trustedBin, 0o755)
+    const cmd = gitnexusCmd({ GITNEXUS_BIN: trustedBin }, { worktree: repoDir })
+    assert.deepEqual(cmd, [realpathSync(trustedBin)])
   })
 })
 
@@ -119,6 +125,14 @@ describe("SEC-004: source tree has no package-manager execution path", () => {
       const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf-8")
       assert.doesNotMatch(source, /gitnexus@\d/)
       assert.doesNotMatch(source, /--registry=/)
+    }
+  })
+
+  it("SEC-005: no source file invokes external 'which' or 'where' binaries for PATH lookup", () => {
+    for (const file of sources) {
+      const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf-8")
+      assert.doesNotMatch(source, /execFileSync\(\s*["'`](?:which|where)["'`]/)
+      assert.doesNotMatch(source, /\? ["']where["'] : ["']which["']/)
     }
   })
 })

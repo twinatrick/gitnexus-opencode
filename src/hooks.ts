@@ -12,6 +12,7 @@ import {
   type HintEnvelopeState,
 } from "./hint-envelope.js"
 import type { LastInjectedRegistry } from "./last-injected.js"
+import type { SessionKind } from "./sessions.js"
 import {
   STATIC_SYSTEM_ADDENDUM,
   STATIC_SYSTEM_ADDENDUM_SUBAGENT,
@@ -39,6 +40,7 @@ export type BackgroundAnalyzeSpawner = (
   repoPath: string,
   config: PluginConfig,
   onDone: () => void,
+  validatedBinary?: string | null,
 ) => void
 
 /**
@@ -53,6 +55,7 @@ export interface AnalyzeState {
     config: PluginConfig,
     scanRoot: string,
     hintState: HintEnvelopeState,
+    validatedBinary?: string | null,
   ): boolean
   /** Test helper: clear the in-flight set. */
   reset(): void
@@ -64,7 +67,7 @@ export function createAnalyzeState(
   const inFlight = new Set<string>()
 
   return {
-    schedule(repoPath, config, scanRoot, hintState) {
+    schedule(repoPath, config, scanRoot, hintState, validatedBinary) {
       if (inFlight.has(repoPath)) return false
 
       inFlight.add(repoPath)
@@ -78,7 +81,7 @@ export function createAnalyzeState(
       }
 
       try {
-        spawner(repoPath, config, cleanup)
+        spawner(repoPath, config, cleanup, validatedBinary)
         return true
       } catch {
         // spawn() threw synchronously (e.g. openSync EACCES, invalid argv, missing binary).
@@ -98,13 +101,17 @@ function analyzeInBackground(
   repoPath: string,
   config: PluginConfig,
   onDone: () => void,
+  validatedBinary?: string | null,
 ) {
-  const cmd = gitnexusCmd()
+  const bin =
+    validatedBinary && validatedBinary.length > 0
+      ? validatedBinary
+      : gitnexusCmd(process.env, { worktree: repoPath })[0]!
   const analyzeArgs = buildAnalyzeArgs(repoPath, config)
   const devNull = openSync("/dev/null", "w")
   let child
   try {
-    child = spawn(cmd[0], [...cmd.slice(1), ...analyzeArgs], {
+    child = spawn(bin, analyzeArgs, {
       stdio: ["ignore", devNull, devNull],
       detached: true,
       cwd: repoPath,
@@ -137,12 +144,14 @@ export interface ToolHooksDeps {
   config: PluginConfig
   /** COMP-002: Whether CLI-backed actions (analyze/refresh) can run. */
   canAnalyze: () => boolean
+  /** SEC-005: Pre-validated CLI binary path from compatibility check (prevents TOCTOU). */
+  getValidatedBinary?: () => string | null
   analyzeState: AnalyzeState
   hintState: HintEnvelopeState
 }
 
 export function createToolHooks(deps: ToolHooksDeps) {
-  const { cwd, config, canAnalyze, analyzeState, hintState } = deps
+  const { cwd, config, canAnalyze, getValidatedBinary, analyzeState, hintState } = deps
   return {
     onToolExecuteAfter(
       input: { tool: string; args: any },
@@ -178,7 +187,7 @@ export function createToolHooks(deps: ToolHooksDeps) {
         const explicit = extractGitDashCPath(cmd, cwd)
         const repoPath = explicit ?? findGitRoot(cwd)
         if (repoPath && hasIndex(repoPath)) {
-          analyzeState.schedule(repoPath, config, cwd, hintState)
+          analyzeState.schedule(repoPath, config, cwd, hintState, getValidatedBinary?.())
         }
       }
     },
@@ -232,7 +241,15 @@ export function extractGitDashCPath(cmd: string, cwd: string): string | null {
  * deps.getCache are required — there are no module-level defaults anymore.
  */
 export interface MessagesTransformDeps {
-  isMain: (sessionID: string) => boolean
+  /**
+   * SEC-006: Tri-state session classification ("main" | "subagent" | "unknown").
+   * Unknown sessions fail closed and do not receive automatic graph injection.
+   */
+  getSessionKind?: (sessionID: string) => SessionKind
+  /**
+   * Legacy boolean callback retained for unit-test compatibility.
+   */
+  isMain?: (sessionID: string) => boolean
   getCache: () => HintCacheState
   /**
    * Optional per-session dedup registry. When supplied, the handler skips
@@ -267,8 +284,13 @@ function historyHasEnvelope(messages: MessageEntry[]): boolean {
 }
 
 export function createMessagesTransformHandler(deps: MessagesTransformDeps) {
-  const { isMain, getCache, lastInjected } = deps
+  const { getSessionKind, isMain, getCache, lastInjected } = deps
   const log = deps.log ?? (() => {})
+  const resolveKind = (sessionID: string): SessionKind => {
+    if (getSessionKind) return getSessionKind(sessionID)
+    if (isMain) return isMain(sessionID) ? "main" : "subagent"
+    return "unknown"
+  }
 
   return async function handle(
     _input: Record<string, never>,
@@ -299,8 +321,11 @@ export function createMessagesTransformHandler(deps: MessagesTransformDeps) {
       // only what the orchestrator wrote, not the plugin's own previous output.
       const scrubbed = scrubPromptGitnexusBlocks(originalText)
       const hasMarker = scrubbed.includes(OPT_IN_MARKER)
-      const main = isMain(sessionID)
-      const eligible = main || hasMarker
+      const kind = resolveKind(sessionID)
+      const main = kind === "main"
+      const eligible =
+        kind === "main" ||
+        (kind === "subagent" && hasMarker)
       if (!eligible) return
 
       const cache = getCache()
@@ -338,13 +363,14 @@ export function createMessagesTransformHandler(deps: MessagesTransformDeps) {
       textPart.text = `${cache.envelope}\n\n${cleaned}`
       lastInjected?.set(sessionID, cache.envelope)
 
+      // DATA-001: Log only non-sensitive metadata and textLength; never log raw user prompt text.
       log(
         "messages.transform injected: sessionID=" + sessionID +
           " main=" + main +
           " marker=" + hasMarker +
           " freshness=" + cache.freshness +
           " dedup=" + (previous === undefined ? "first" : "changed") +
-          ' textPreview="' + cleaned.slice(0, 60).replace(/\n/g, " ") + '"',
+          " textLength=" + cleaned.length,
         "info",
       )
     } catch (err) {

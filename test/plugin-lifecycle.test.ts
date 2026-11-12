@@ -10,9 +10,10 @@ import {
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { execFileSync } from "node:child_process"
 import plugin from "../src/index.js"
+import { OPT_IN_MARKER } from "../src/hint-envelope.js"
 
 interface TestLog {
   level?: string
@@ -48,7 +49,12 @@ function initGitRepo(repoDir: string, withIndex: boolean): string {
   return head
 }
 
-async function createHarness(repoDir: string): Promise<Harness> {
+async function createHarness(
+  repoDir: string,
+  sessionListImpl: () => Promise<{ data: Array<{ id?: string; parentID?: string }> }> = async () => ({
+    data: [],
+  }),
+): Promise<Harness> {
   const logs: TestLog[] = []
   const client = {
     app: {
@@ -56,7 +62,7 @@ async function createHarness(repoDir: string): Promise<Harness> {
         logs.push(input.body)
       },
     },
-    session: { list: async () => ({ data: [] }) },
+    session: { list: sessionListImpl },
     tui: { showToast: async () => {} },
   }
   const hooks = await plugin({
@@ -240,5 +246,184 @@ describe("COMP-002 / SEC-004: plugin lifecycle without a package manager", () =>
     assert.equal(existsSync(marker), true)
     const args = readFileSync(marker, "utf-8").split("\n").filter(Boolean)
     assert.deepEqual(args, ["analyze", "--index-only", repoDir])
+  })
+
+  it("SEC-005: session startup does NOT execute repository-controlled binaries or malicious which/where on PATH", async () => {
+    initGitRepo(repoDir, true)
+    const hijackMarker = join(tmpRoot, "startup-hijack.log")
+    const nmBinDir = join(repoDir, "node_modules", ".bin")
+    const evilShimDir = join(tmpRoot, "evil-shims")
+    mkdirSync(nmBinDir, { recursive: true })
+    mkdirSync(evilShimDir, { recursive: true })
+
+    for (const target of [
+      join(repoDir, "gitnexus"),
+      join(nmBinDir, "gitnexus"),
+      join(evilShimDir, "which"),
+      join(evilShimDir, "where"),
+    ]) {
+      writeFileSync(target, `#!/bin/sh\necho hijacked >> "${hijackMarker}"\necho "1.6.12"\nexit 0\n`)
+      chmodSync(target, 0o755)
+    }
+
+    const savedPath = process.env.PATH
+    try {
+      delete process.env.GITNEXUS_DISABLE_LOCAL_BIN
+      delete process.env.GITNEXUS_BIN
+      process.env.PATH = [".", repoDir, nmBinDir, evilShimDir].join(delimiter)
+
+      const { hooks } = await createHarness(repoDir)
+      await startSession(hooks)
+
+      assert.equal(
+        existsSync(hijackMarker),
+        false,
+        "session startup must never execute repo binaries or which/where shims",
+      )
+    } finally {
+      process.env.PATH = savedPath
+    }
+  })
+
+  it("SEC-006: client.session.list() failure during hydration fails closed for unknown sessions", async () => {
+    initGitRepo(repoDir, true)
+    process.env.GITNEXUS_DISABLE_LOCAL_BIN = "1"
+    delete process.env.GITNEXUS_BIN
+
+    const { hooks } = await createHarness(repoDir, async () => {
+      throw new Error("session.list RPC unavailable")
+    })
+    // Populate hint cache via a known main session creation
+    await startSession(hooks)
+
+    // An unclassified subagent (never seen in session.created or session.list) must be denied
+    const unknownSubagentMessages = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_unclassified_subagent" },
+          parts: [{ type: "text", text: "unclassified subagent prompt" }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!(
+      {} as never,
+      unknownSubagentMessages as never,
+    )
+    assert.equal(
+      (unknownSubagentMessages.messages[0]!.parts[0] as { text: string }).text,
+      "unclassified subagent prompt",
+      "unknown subagent must not receive graph envelope when session.list() fails",
+    )
+  })
+
+  it("SEC-006: hydration race condition fails closed while in flight and restores main/subagent classification after plugin reload", async () => {
+    initGitRepo(repoDir, true)
+    process.env.GITNEXUS_DISABLE_LOCAL_BIN = "1"
+    delete process.env.GITNEXUS_BIN
+
+    let resolveList!: (val: { data: Array<{ id?: string; parentID?: string }> }) => void
+    const delayedList = new Promise<{ data: Array<{ id?: string; parentID?: string }> }>((res) => {
+      resolveList = res
+    })
+
+    const { hooks } = await createHarness(repoDir, () => delayedList)
+    // Refresh cache via a bootstrap session
+    await startSession(hooks)
+
+    // 1. Race condition: before session.list() resolves, pre-existing reloaded sessions are still "unknown"
+    const racingSubagent = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_reloaded_sub" },
+          parts: [{ type: "text", text: "subagent racing hydration" }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!({} as never, racingSubagent as never)
+    assert.equal(
+      (racingSubagent.messages[0]!.parts[0] as { text: string }).text,
+      "subagent racing hydration",
+      "unhydrated session must fail closed while hydration is in flight",
+    )
+
+    // 2. Complete hydration (simulating plugin reload with existing main + subagent sessions)
+    resolveList({
+      data: [
+        { id: "ses_reloaded_main" },
+        { id: "ses_reloaded_sub", parentID: "ses_reloaded_main" },
+      ],
+    })
+    await delayedList
+    await new Promise((r) => setImmediate(r))
+
+    // Hydrated main session receives envelope automatically
+    const mainTurn = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_reloaded_main" },
+          parts: [{ type: "text", text: "main prompt after reload" }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!({} as never, mainTurn as never)
+    assert.match(
+      (mainTurn.messages[0]!.parts[0] as { text: string }).text,
+      /^<gitnexus_graph /,
+      "hydrated main session must receive graph envelope",
+    )
+
+    // Hydrated subagent without marker is denied
+    const subNoMarker = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_reloaded_sub" },
+          parts: [{ type: "text", text: "subagent without marker after reload" }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!({} as never, subNoMarker as never)
+    assert.equal(
+      (subNoMarker.messages[0]!.parts[0] as { text: string }).text,
+      "subagent without marker after reload",
+    )
+
+    // Hydrated subagent WITH marker receives envelope
+    const subWithMarker = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_reloaded_sub" },
+          parts: [{ type: "text", text: `${OPT_IN_MARKER} subagent with marker after reload` }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!({} as never, subWithMarker as never)
+    assert.match(
+      (subWithMarker.messages[0]!.parts[0] as { text: string }).text,
+      /^<gitnexus_graph /,
+      "hydrated subagent with marker must receive graph envelope",
+    )
+
+    // 3. session.deleted reverts session to "unknown" and must NOT grant main access
+    await hooks.event!({
+      event: {
+        type: "session.deleted",
+        properties: { info: { id: "ses_reloaded_sub" } },
+      },
+    } as never)
+
+    const afterDelete = {
+      messages: [
+        {
+          info: { role: "user", sessionID: "ses_reloaded_sub" },
+          parts: [{ type: "text", text: "turn after session.deleted" }],
+        },
+      ],
+    }
+    await hooks["experimental.chat.messages.transform"]!({} as never, afterDelete as never)
+    assert.equal(
+      (afterDelete.messages[0]!.parts[0] as { text: string }).text,
+      "turn after session.deleted",
+      "deleted session must revert to unknown and never receive main access",
+    )
   })
 })

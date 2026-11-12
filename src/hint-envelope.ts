@@ -1,27 +1,47 @@
 import { discoverRepos, type RepoInfo } from "./discovery.js"
 
+const LONE_SURROGATE_RE =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g
+
+const XML_NONCHAR_RE = /[\uFFFE\uFFFF]/g
+
+const DISALLOWED_TEXT_CTRL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F]/g
+
+const DISALLOWED_ATTR_CTRL_RE = /[\x00-\x1F\x7F-\x84\x86-\x9F]/g
+
 /**
- * Input validation + XML 1.0 control character sanitization for text nodes.
- * Normalizes CRLF/CR line endings to LF and strips disallowed XML 1.0 control
- * characters (U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+0084, U+0086-U+009F)
- * while preserving valid horizontal tab (\t) and line feed (\n).
+ * SEC-003 & SEC-007: Input validation + XML 1.0 Fifth Edition character
+ * sanitization for text nodes.
+ * Normalizes CRLF/CR line endings to LF, removes lone UTF-16 surrogates
+ * (U+D800-U+DFFF), removes noncharacters (U+FFFE, U+FFFF), and strips
+ * disallowed XML 1.0 control characters while preserving valid horizontal
+ * tab (\t) and line feed (\n).
  */
 export function sanitizeXmlText(val: unknown): string {
   const validated = typeof val === "string" ? val : String(val ?? "")
   return validated
     .replace(/\r\n?/g, "\n")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F]/g, "")
+    .replace(LONE_SURROGATE_RE, "")
+    .replace(XML_NONCHAR_RE, "")
+    .replace(DISALLOWED_TEXT_CTRL_RE, "")
+    .replace(LONE_SURROGATE_RE, "")
 }
 
 /**
- * Input validation + XML 1.0 control character sanitization for XML attributes.
- * Normalizes embedded newlines/tabs to spaces and strips all C0/DEL/C1 control characters.
+ * SEC-003 & SEC-007: Input validation + XML 1.0 Fifth Edition character
+ * sanitization for XML attributes.
+ * Normalizes embedded newlines/tabs to spaces, removes lone UTF-16 surrogates
+ * (U+D800-U+DFFF), removes noncharacters (U+FFFE, U+FFFF), and strips all
+ * C0/DEL/C1 control characters.
  */
 export function sanitizeXmlAttr(val: unknown): string {
   const validated = typeof val === "string" ? val : String(val ?? "")
   return validated
     .replace(/[\r\n\t]+/g, " ")
-    .replace(/[\x00-\x1F\x7F-\x84\x86-\x9F]/g, "")
+    .replace(LONE_SURROGATE_RE, "")
+    .replace(XML_NONCHAR_RE, "")
+    .replace(DISALLOWED_ATTR_CTRL_RE, "")
+    .replace(LONE_SURROGATE_RE, "")
 }
 
 /**

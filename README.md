@@ -5,10 +5,10 @@ OpenCode plugin for [GitNexus](https://github.com/nicepkg/gitnexus) — automati
 ## What it does
 
 **On session start:**
-- Verifies GitNexus CLI is reachable (disables plugin if not)
+- Verifies whether a trusted local GitNexus CLI is reachable (gates `gitnexus_analyze` and background refresh, while keeping existing graph context active)
 - Discovers git repos (current dir + subdirectories)
-- Classifies the session: subagents are tracked by `parentID`; everything else defaults to main and gets the dynamic graph envelope on its user messages
-- Hydrates the subagent registry from `client.session.list()` so long-lived subagents survive plugin reloads
+- Classifies the session into `"main"` (no `parentID`) or `"subagent"` (has `parentID`); unclassified sessions remain `"unknown"` and fail closed until classified
+- Hydrates the session registry (both `"main"` and `"subagent"`) from `client.session.list()` so existing sessions survive plugin reloads without failing open
 - Shows toast with graph status (delayed 6s to avoid oh-my-openagent spinner overlap)
 - Background-refreshes stale indexes
 
@@ -42,7 +42,7 @@ There are two variants:
 - **Full** addendum (~510 tokens) — pushed onto **main** sessions. Covers everything: envelope contract, subagent propagation rules, delegate-to-subagent nudge, and the build-graph rule.
 - **Lite** addendum (~160 tokens) — pushed onto **subagent** sessions. Covers only the envelope contract and tool preference. Omits subagent propagation (subagents rarely spawn further subagents) and the build-graph rule (`gitnexus_analyze` is intended for the main agent).
 
-The variant is chosen per chat call from the `sessionID` and the `SessionRegistry`. The registry tracks **subagents** positively (by `parentID`) and defaults unknown sessions to **main** — the safer failure mode, since the dynamic envelope is independently gated by the `[[gitnexus:graph]]` marker check.
+The variant is chosen per chat call from the `sessionID` and the `SessionRegistry`. The registry classifies sessions as `"main"`, `"subagent"`, or `"unknown"` (fail-closed): only positively identified `"main"` sessions receive the Full addendum and automatic user-message envelopes, while `"subagent"` sessions require the explicit `[[gitnexus:graph]]` marker and `"unknown"` sessions fail closed until classified.
 
 **Layer 2 — dynamic envelope (in user message).**
 Per-instance data that does change: which repos are indexed in this workspace right now, their paths, and freshness state. Read fresh on every turn. The envelope cross-references the system prompt for the rules instead of duplicating them.
@@ -60,7 +60,7 @@ Splitting puts the **rules** in the highest-salience location for instruction-fo
 | **1. Local Binary Mode (Default)** | No | Resolves `GITNEXUS_BIN` or the local `gitnexus` binary on `PATH` (minimum supported version: `>= 1.6.12` with `--index-only` support). Fails safely if missing. |
 | **2. Air-Gap Mode** | No | Pre-install `gitnexus` (`>= 1.6.12`) from an offline tarball/image or set `GITNEXUS_BIN` to the offline executable. Session checks (`--version` / `analyze --help`) and indexing never trigger network downloads. |
 
-> **Invariant (SEC-004):** This plugin never invokes `npm`, `npx`, `pnpm`, `yarn`, or `bunx`, and it never downloads package code at runtime. It executes only the local binary resolved from `GITNEXUS_BIN` or `PATH`. A repository-level `.npmrc`, `package.json`, or legacy `allowNpxFallback` / `gitnexusVersion` key cannot change the package source or turn on a download path.
+> **Invariant (SEC-004 & SEC-005):** This plugin never invokes `npm`, `npx`, `pnpm`, `yarn`, `bunx`, `which`, or `where`, and it never downloads package code at runtime. It resolves only a trusted local executable from `GITNEXUS_BIN` or `PATH` using Node.js `fs`/`path` APIs, rejecting relative `PATH` entries (`.`), `node_modules/.bin`, and any binary or symlink resolving inside the repository. A repository-level `.npmrc`, `package.json`, or legacy `allowNpxFallback` / `gitnexusVersion` key cannot change the package source or execute repository binaries.
 
 ### Prerequisite: Install Local GitNexus CLI (`>= 1.6.12`)
 
@@ -146,8 +146,8 @@ Produces `dist/gitnexus-opencode.js` — single file, all internal modules bundl
 
 The static rule block is delivered through `experimental.chat.system.transform`. On every LLM call the plugin appends one of the two addendum variants to `output.system`:
 
-- **Full** for main sessions (and for unknown sessions — conservative default, see below)
-- **Lite** for sessions positively identified as subagents via the `SessionRegistry`
+- **Full** for sessions positively identified as `"main"` via the `SessionRegistry`
+- **Lite** for `"subagent"` and unclassified (`"unknown"`) sessions
 
 Skipped if:
 - no GitNexus CLI is available **and** the workspace has no indexed repo (nothing the addendum could act on; COMP-002), or
@@ -161,20 +161,21 @@ The full addendum also nudges the main agent to **delegate open-ended exploratio
 
 The addendum is pushed for every session where the plugin is active, including ones launched from a directory with no locally indexed repos. In that case the addendum tells the agent to call `gitnexus_list_repos` once to discover repos indexed elsewhere on the machine.
 
-#### Session classification (subagent vs. main)
+#### Session classification (`main` vs. `subagent` vs. `unknown`)
 
-The `SessionRegistry` tracks **subagent** sessions positively (by presence of `parentID` on `session.created`) and defaults unknown sessions to **main**. This is the safe failure mode: misclassifying an unknown session as main only adds harmless extra text to its system prompt, while the user-message envelope is still gated by the `[[gitnexus:graph]]` marker check in `messages.transform` — so an unmarked subagent does NOT receive the envelope just because it was misclassified.
+The `SessionRegistry` maintains a tri-state classification (`"main" | "subagent" | "unknown"`). On `session.created`, sessions without `parentID` are recorded as `"main"` and sessions with `parentID` are recorded as `"subagent"`. On `session.deleted`, the session is removed and reverts to `"unknown"`. Any session in the `"unknown"` state fails closed (SEC-006): it never receives automatic `<gitnexus_graph>` injection.
 
-On plugin init the registry is **hydrated** from `client.session.list()`: every existing session with a `parentID` is re-registered as a subagent. This way long-lived subagents survive plugin reloads and session compaction without being silently re-classified as main and seeing the wrong addendum variant.
+On plugin init the registry is **hydrated** from `client.session.list()`: every existing session is registered as either `"main"` (no `parentID`) or `"subagent"` (has `parentID`). If `client.session.list()` fails or while hydration is still in flight, unclassified sessions remain `"unknown"` (fail-closed) until classified.
 
 ### Envelope delivery (Layer 2)
 
 The dynamic envelope is delivered through OpenCode's `experimental.chat.messages.transform` hook. On every LLM call the plugin:
 
 1. Finds the last user message in the transient message array OpenCode is about to send to the model
-2. Decides eligibility:
-   - **Main session** (top-level, no `parentID`) — always eligible
-   - **Subagent session** — eligible only if the orchestrator wrote the explicit opt-in marker `[[gitnexus:graph]]` into the subagent's prompt
+2. Decides eligibility (fail-closed):
+   - **Main session** (`kind === "main"`, top-level, no `parentID`) — eligible automatically
+   - **Subagent session** (`kind === "subagent"`) — eligible only if the orchestrator wrote the explicit opt-in marker `[[gitnexus:graph]]` into the subagent's prompt
+   - **Unknown session** (`kind === "unknown"`) — never eligible until classified
 3. **Per-session dedup check**: if the next-turn envelope is byte-identical to the one last injected into this session, skip injection. Strip the opt-in marker if present (otherwise it would leak into subagent prompts as literal text) and exit. The agent already has the envelope in conversation history.
 4. If the envelope is new (or the registry was cleared by compaction), scrubs any leading `<gitnexus_graph>...</gitnexus_graph>` block left over from a previous turn (idempotency), strips the opt-in marker, and prepends the fresh envelope to the user message text. Records the injection in the `LastInjectedRegistry`.
 5. Logs an `info`-level summary line so the behavior is observable from the plugin log file

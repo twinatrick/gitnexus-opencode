@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 
 export const MIN_SUPPORTED_GITNEXUS_VERSION = "1.6.12";
 
@@ -34,6 +34,14 @@ export interface CliCompatibilityResult {
 }
 
 export type CliRunner = (file: string, args: string[]) => string;
+
+export interface ResolveBinaryOptions {
+  /**
+   * Untrusted workspace/repository directory. Any binary located inside this
+   * directory (directly or via symlink resolution) is rejected (SEC-005).
+   */
+  worktree?: string;
+}
 
 const DEFAULTS: PluginConfig = {
   autoIndex: true,
@@ -212,47 +220,165 @@ export function loadConfig(worktree?: string, options?: LoadConfigOptions): Plug
   };
 }
 
-export function resolveLocalGitnexusBin(env: NodeJS.ProcessEnv = process.env): string | null {
-  if (env.GITNEXUS_DISABLE_LOCAL_BIN === "1") {
+function hasNodeModulesSegment(p: string): boolean {
+  return /(?:^|[\\/])node_modules(?:[\\/]|$)/.test(p);
+}
+
+function hasNodeModulesBinSegment(p: string): boolean {
+  return /(?:^|[\\/])node_modules[\\/]\.bin(?:[\\/]|$)/.test(p);
+}
+
+function isPathInside(childPath: string, parentPath: string): boolean {
+  const rel = relative(parentPath, childPath);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function collectUntrustedRoots(worktree?: string): string[] {
+  const roots = new Set<string>();
+  const addRoot = (raw?: string) => {
+    if (!raw || !raw.trim()) return;
+    const resolved = resolve(raw.trim());
+    roots.add(resolved);
+    try {
+      roots.add(realpathSync(resolved));
+    } catch {
+      // Directory may not exist yet in synthetic tests.
+    }
+  };
+
+  if (worktree && worktree.trim().length > 0) {
+    addRoot(worktree);
+  } else {
+    const cwd = process.cwd();
+    if (!isPathInside(tmpdir(), cwd)) {
+      addRoot(cwd);
+    }
+  }
+  return [...roots];
+}
+
+function validateExecutableFile(
+  candidatePath: string,
+  untrustedRoots: string[],
+): string | null {
+  if (!isAbsolute(candidatePath)) return null;
+  if (/(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(candidatePath)) return null;
+
+  const normalizedCandidate = resolve(candidatePath);
+  if (hasNodeModulesBinSegment(normalizedCandidate)) return null;
+  if (untrustedRoots.some((root) => isPathInside(normalizedCandidate, root))) {
     return null;
   }
-  if (env.GITNEXUS_BIN && env.GITNEXUS_BIN.trim().length > 0) {
-    return env.GITNEXUS_BIN.trim();
-  }
+
+  let realCandidate: string;
   try {
-    const cmd = process.platform === "win32" ? "where" : "which";
-    const out = execFileSync(cmd, ["gitnexus"], {
-      encoding: "utf-8",
-      timeout: 3000,
-      env,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const first = out
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean)[0];
-    return first || null;
+    realCandidate = realpathSync(normalizedCandidate);
   } catch {
     return null;
   }
+
+  if (hasNodeModulesBinSegment(realCandidate)) return null;
+  if (untrustedRoots.some((root) => isPathInside(realCandidate, root))) {
+    return null;
+  }
+
+  try {
+    const st = statSync(realCandidate);
+    if (!st.isFile()) return null;
+    if (process.platform !== "win32") {
+      accessSync(realCandidate, constants.X_OK);
+    }
+  } catch {
+    return null;
+  }
+
+  return realCandidate;
 }
 
 /**
- * SEC-004: Resolves an execution command for the GitNexus CLI.
+ * SEC-005: Resolves a trusted local GitNexus CLI binary using Node.js
+ * filesystem APIs only (never invokes `which` or `where`).
  *
- * The plugin deliberately has no package-manager fallback. It only executes a
- * local binary, so an untrusted repository cannot influence package sources
- * through `.npmrc`, `npm_config_*`, or registry settings.
+ * Security invariants:
+ * - Honors explicit `GITNEXUS_BIN` first, requiring an existing executable at an
+ *   absolute path whose canonical realpath is outside the repository/worktree.
+ * - Rejects relative PATH entries (e.g. `.`, `./bin`).
+ * - Rejects PATH entries inside `node_modules` (e.g. `node_modules/.bin`).
+ * - Rejects binaries inside the repository/worktree or symlinks resolving into it.
+ * - Returns the canonical absolute `realpath` of the validated executable.
  */
-export function gitnexusCmd(env: NodeJS.ProcessEnv = process.env): string[] {
-  const localBin = resolveLocalGitnexusBin(env);
+export function resolveLocalGitnexusBin(
+  env: NodeJS.ProcessEnv = process.env,
+  options?: ResolveBinaryOptions,
+): string | null {
+  if (env.GITNEXUS_DISABLE_LOCAL_BIN === "1") {
+    return null;
+  }
+
+  const untrustedRoots = collectUntrustedRoots(options?.worktree);
+
+  if (env.GITNEXUS_BIN && env.GITNEXUS_BIN.trim().length > 0) {
+    return validateExecutableFile(env.GITNEXUS_BIN.trim(), untrustedRoots);
+  }
+
+  const rawPath = env.PATH ?? "";
+  if (!rawPath) return null;
+
+  const candidateNames =
+    process.platform === "win32"
+      ? ["gitnexus.exe", "gitnexus.cmd", "gitnexus.bat", "gitnexus"]
+      : ["gitnexus"];
+
+  for (const rawEntry of rawPath.split(delimiter)) {
+    const dir = rawEntry.trim();
+    if (!dir) continue;
+    if (!isAbsolute(dir)) continue;
+    if (/(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(dir)) continue;
+    if (hasNodeModulesSegment(dir)) continue;
+
+    const resolvedDir = resolve(dir);
+    if (untrustedRoots.some((root) => isPathInside(resolvedDir, root))) continue;
+
+    let realDir: string;
+    try {
+      realDir = realpathSync(resolvedDir);
+    } catch {
+      continue;
+    }
+    if (hasNodeModulesSegment(realDir)) continue;
+    if (untrustedRoots.some((root) => isPathInside(realDir, root))) continue;
+
+    for (const exeName of candidateNames) {
+      const validated = validateExecutableFile(
+        join(resolvedDir, exeName),
+        untrustedRoots,
+      );
+      if (validated) return validated;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * SEC-004 & SEC-005: Resolves a validated local execution command for the
+ * GitNexus CLI.
+ *
+ * The plugin deliberately has no package-manager fallback and never trusts
+ * relative PATH entries, `node_modules/.bin`, or repository-controlled binaries.
+ */
+export function gitnexusCmd(
+  env: NodeJS.ProcessEnv = process.env,
+  options?: ResolveBinaryOptions,
+): string[] {
+  const localBin = resolveLocalGitnexusBin(env, options);
   if (localBin) {
     return [localBin];
   }
   throw new Error(
-    "Local gitnexus binary not found on PATH (or GITNEXUS_BIN). " +
-      "This plugin never downloads packages via npm/npx. " +
-      `Install gitnexus >= ${MIN_SUPPORTED_GITNEXUS_VERSION} locally, or use an air-gap install and point GITNEXUS_BIN at it.`,
+    "Local gitnexus binary not found on a trusted PATH (or GITNEXUS_BIN). " +
+      "This plugin never downloads packages via npm/npx and rejects untrusted repository binaries. " +
+      `Install gitnexus >= ${MIN_SUPPORTED_GITNEXUS_VERSION} in a trusted local directory, or point GITNEXUS_BIN at its absolute path.`,
   );
 }
 
@@ -272,17 +398,19 @@ function defaultCliRunner(file: string, args: string[]): string {
 }
 
 /**
- * COMP-001 & SEC-004: Validates local GitNexus CLI availability, SemVer >= MIN_SUPPORTED_GITNEXUS_VERSION,
- * and `--index-only` capability. Never invokes a package manager or network download.
+ * COMP-001, SEC-004 & SEC-005: Validates local GitNexus CLI availability,
+ * SemVer >= MIN_SUPPORTED_GITNEXUS_VERSION, and `--index-only` capability
+ * against a single canonical binary path (preventing TOCTOU re-resolution).
  */
 export function checkGitNexusCliCompatibility(options?: {
   env?: NodeJS.ProcessEnv;
+  worktree?: string;
   execRunner?: CliRunner;
 }): CliCompatibilityResult {
   const env = options?.env ?? process.env;
   const runner = options?.execRunner ?? defaultCliRunner;
 
-  const localBin = resolveLocalGitnexusBin(env);
+  const localBin = resolveLocalGitnexusBin(env, { worktree: options?.worktree });
   if (!localBin) {
     return {
       compatible: false,

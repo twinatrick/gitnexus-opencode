@@ -283,3 +283,56 @@ describe("OPT_IN_MARKER constant", () => {
     assert.equal(OPT_IN_MARKER, "[[gitnexus:graph]]")
   })
 })
+
+describe("SEC-007: XML 1.0 Fifth Edition character sanitization", () => {
+  it("strips U+FFFE and U+FFFF noncharacters from text and attributes", () => {
+    assert.equal(sanitizeXmlText("alpha\uFFFEbeta\uFFFFgamma"), "alphabetagamma")
+    assert.equal(sanitizeXmlAttr("attr\uFFFEval\uFFFFend"), "attrvalend")
+    assert.equal(escapeXml(sanitizeXmlText("tag\uFFFE&\uFFFFname")), "tag&amp;name")
+  })
+
+  it("strips lone UTF-16 high and low surrogates while preventing surrogate synthesis", () => {
+    // Unpaired high surrogates (\uD800, \uDBFF) and low surrogates (\uDC00, \uDFFF)
+    assert.equal(sanitizeXmlText("hi\uD800mid\uDC00end\uDFFF\uDBFF"), "himidend")
+    assert.equal(sanitizeXmlAttr("a\uD800b\uDC00c\uDFFF"), "abc")
+    // Separated halves must not merge into a surrogate pair when control/nonchar bytes are stripped
+    assert.equal(sanitizeXmlText("x\uD800\x00\uDC00y"), "xy")
+    assert.equal(sanitizeXmlText("x\uD800\uFFFE\uDC00y"), "xy")
+    assert.equal(sanitizeXmlAttr("x\uD800\x00\uDC00y"), "xy")
+  })
+
+  it("preserves valid Unicode, CJK characters, and astral-plane Emoji surrogate pairs", () => {
+    const validText = "GitNexus 知識圖譜測試 — café 🚀🔒✨\n\tsecond line"
+    assert.equal(sanitizeXmlText(validText), validText)
+    assert.equal(
+      sanitizeXmlAttr("GitNexus 知識圖譜測試 — café 🚀🔒✨"),
+      "GitNexus 知識圖譜測試 — café 🚀🔒✨",
+    )
+  })
+
+  it("produces a valid XML 1.0 envelope even when repo metadata contains noncharacters and lone surrogates", () => {
+    const state = createHintEnvelopeState()
+    const malformedName = "evil\uFFFErepo\uFFFF\uD800mid\uDC00end\uDFFF"
+    const malformedPath = "/tmp/evil\uFFFEpath\uFFFF\uD800/repo"
+    state.rebuildHintCache([
+      {
+        name: malformedName,
+        path: malformedPath,
+        hasIndex: true,
+        isStale: false,
+      },
+    ])
+    const cache = state.getHintCache()
+
+    assert.ok(cache.envelope.startsWith("<gitnexus_graph "))
+    assert.ok(cache.envelope.endsWith("</gitnexus_graph>"))
+    assert.equal(/[\uFFFE\uFFFF]/.test(cache.envelope), false)
+    assert.equal(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(
+        cache.envelope,
+      ),
+      false,
+    )
+    assert.equal(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F]/.test(cache.envelope), false)
+  })
+})

@@ -1,58 +1,53 @@
 /**
- * Tracks which session IDs are SUBAGENT (spawned child) sessions, identified by
- * the presence of `parentID` on `event(session.created)`. The public API still
- * answers `isMain(sessionID)` — internally that is `!subagentSessions.has(id)`.
+ * SEC-006: Tri-state session classification registry ("main" | "subagent" | "unknown").
  *
- * Why we track subagents (positive identification) and treat unknown sessions
- * as MAIN by default:
+ * Why unknown sessions must FAIL CLOSED (`"unknown"` -> not main):
  *
- *   - `parentID` is the only reliable subagent signal: OpenCode sets it at
- *     spawn time; main sessions never have one.
- *   - The previous design tracked main sessions positively. After plugin
- *     reload or session compaction the in-memory set is empty and a real main
- *     session looks "unknown" — and was being misclassified as a subagent.
- *     That is the worst direction to fail in: the subagent-lite addendum omits
- *     the OPT_IN_MARKER propagation rules, so the orchestrator silently fails
- *     to grant graph access to spawned code agents.
- *   - Misclassifying an unknown subagent as main is the safer failure mode:
- *     it adds extra (harmless) text to the system prompt; the user-message
- *     envelope is still gated by the OPT_IN_MARKER check in
- *     `messages.transform`, so an unmarked subagent does NOT receive the
- *     envelope just because it was misclassified here.
+ *   - `parentID` on `event(session.created)` or `client.session.list()`
+ *     distinguishes spawned subagent sessions from main orchestrator sessions.
+ *   - Treating `"unknown"` as `"main"` allowed an unclassified subagent (e.g.
+ *     when `client.session.list()` failed, while hydration was still in flight,
+ *     or after `session.deleted`) to bypass the `OPT_IN_MARKER` check and
+ *     automatically receive the repository graph envelope.
+ *   - Both main sessions (no `parentID`) and subagents (with `parentID`) are
+ *     positively recorded on `session.created` and during `session.list()`
+ *     hydration. Any session not yet classified remains `"unknown"` and cannot
+ *     receive automatic graph injection.
  *
- * The `index.ts` entrypoint hydrates this registry on plugin init by replaying
- * `client.session.list()` so long-lived subagents survive a plugin reload.
- *
- * Source of truth for newly-created sessions: the `event(session.created)`
- * hook in `src/index.ts`.
- *
- * Each call to `createSessionRegistry()` returns its own isolated Set, so two
+ * Each call to `createSessionRegistry()` returns its own isolated Map, so two
  * plugin instances in the same node process do not share state.
  */
+
+export type SessionKind = "main" | "subagent" | "unknown"
 
 export interface SessionRegistry {
   trackCreated(info: { id: string; parentID?: string }): void
   trackDeleted(info: { id: string }): void
+  getKind(sessionID: string): SessionKind
   isMain(sessionID: string): boolean
   /** Test helper: clear every tracked session. */
   reset(): void
 }
 
 export function createSessionRegistry(): SessionRegistry {
-  const subagentSessions = new Set<string>()
+  const sessions = new Map<string, "main" | "subagent">()
 
   return {
     trackCreated(info) {
-      if (info.parentID) subagentSessions.add(info.id)
+      if (!info.id) return
+      sessions.set(info.id, info.parentID ? "subagent" : "main")
     },
     trackDeleted(info) {
-      subagentSessions.delete(info.id)
+      sessions.delete(info.id)
+    },
+    getKind(sessionID) {
+      return sessions.get(sessionID) ?? "unknown"
     },
     isMain(sessionID) {
-      return !subagentSessions.has(sessionID)
+      return sessions.get(sessionID) === "main"
     },
     reset() {
-      subagentSessions.clear()
+      sessions.clear()
     },
   }
 }

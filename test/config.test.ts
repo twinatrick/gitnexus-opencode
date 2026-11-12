@@ -1,11 +1,21 @@
 import { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import {
   loadConfig,
   getDeprecatedConfigKeys,
+  resolveLocalGitnexusBin,
   gitnexusCmd,
   buildAnalyzeArgs,
   parseSemVer,
@@ -137,12 +147,29 @@ describe("loadConfig & Security Trust Boundary (SEC-002, SEC-004)", () => {
   })
 })
 
-describe("gitnexusCmd: local-binary-only execution (SEC-004)", () => {
-  const noLocalBinEnv = { GITNEXUS_DISABLE_LOCAL_BIN: "1", PATH: "" }
+function createExecutable(filePath: string, body = "#!/bin/sh\nexit 0\n"): string {
+  writeFileSync(filePath, body)
+  chmodSync(filePath, 0o755)
+  return filePath
+}
 
-  it("resolves local binary from GITNEXUS_BIN when present", () => {
-    const cmd = gitnexusCmd({ GITNEXUS_BIN: "/usr/local/bin/gitnexus" })
-    assert.deepEqual(cmd, ["/usr/local/bin/gitnexus"])
+describe("gitnexusCmd: local-binary-only execution (SEC-004, SEC-005)", () => {
+  const noLocalBinEnv = { GITNEXUS_DISABLE_LOCAL_BIN: "1", PATH: "" }
+  let tmpBinDir: string
+  let trustedBin: string
+
+  beforeEach(() => {
+    tmpBinDir = mkdtempSync(join(tmpdir(), "gitnexus-trusted-bin-"))
+    trustedBin = createExecutable(join(tmpBinDir, "gitnexus"))
+  })
+
+  afterEach(() => {
+    rmSync(tmpBinDir, { recursive: true, force: true })
+  })
+
+  it("resolves local binary from a validated GITNEXUS_BIN when present", () => {
+    const cmd = gitnexusCmd({ GITNEXUS_BIN: trustedBin })
+    assert.deepEqual(cmd, [realpathSync(trustedBin)])
   })
 
   it("fails safely with an actionable message when no local binary exists", () => {
@@ -152,7 +179,7 @@ describe("gitnexusCmd: local-binary-only execution (SEC-004)", () => {
     )
     assert.throws(
       () => gitnexusCmd(noLocalBinEnv),
-      /Install gitnexus >= 1\.6\.12 locally|GITNEXUS_BIN/,
+      /Install gitnexus >= 1\.6\.12|GITNEXUS_BIN/,
     )
   })
 
@@ -160,7 +187,7 @@ describe("gitnexusCmd: local-binary-only execution (SEC-004)", () => {
     assert.throws(() =>
       gitnexusCmd({
         GITNEXUS_DISABLE_LOCAL_BIN: "1",
-        GITNEXUS_BIN: "/usr/local/bin/gitnexus",
+        GITNEXUS_BIN: trustedBin,
       }),
     )
   })
@@ -175,7 +202,192 @@ describe("gitnexusCmd: local-binary-only execution (SEC-004)", () => {
   })
 })
 
-describe("Version Compatibility & Capability Detection (COMP-001, SEC-004)", () => {
+describe("SEC-005: Untrusted PATH & Repository Binary Hijacking Prevention", () => {
+  let tmpRoot: string
+  let repoDir: string
+  let trustedBinDir: string
+  let markerPath: string
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "gitnexus-sec005-"))
+    repoDir = join(tmpRoot, "untrusted-repo")
+    trustedBinDir = join(tmpRoot, "trusted-bin")
+    markerPath = join(tmpRoot, "hijack-executed.log")
+    mkdirSync(join(repoDir, "node_modules", ".bin"), { recursive: true })
+    mkdirSync(trustedBinDir, { recursive: true })
+  })
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  it("rejects relative PATH entries such as '.' even when ./gitnexus exists", () => {
+    const evilBin = createExecutable(
+      join(repoDir, "gitnexus"),
+      `#!/bin/sh\necho pwned >> "${markerPath}"\nexit 0\n`,
+    )
+    assert.ok(existsSync(evilBin))
+
+    const resolved = resolveLocalGitnexusBin(
+      { PATH: [".", "./bin", "../untrusted-repo"].join(delimiter) },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, null)
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("rejects PATH entries inside node_modules/.bin", () => {
+    const nmBinDir = join(repoDir, "node_modules", ".bin")
+    createExecutable(
+      join(nmBinDir, "gitnexus"),
+      `#!/bin/sh\necho pwned >> "${markerPath}"\nexit 0\n`,
+    )
+
+    const externalNmDir = join(tmpRoot, "external", "node_modules", ".bin")
+    mkdirSync(externalNmDir, { recursive: true })
+    createExecutable(
+      join(externalNmDir, "gitnexus"),
+      `#!/bin/sh\necho pwned >> "${markerPath}"\nexit 0\n`,
+    )
+
+    const resolved = resolveLocalGitnexusBin(
+      { PATH: [nmBinDir, externalNmDir].join(delimiter) },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, null)
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("never executes a malicious 'which' binary placed on PATH", () => {
+    const evilRepoBin = createExecutable(
+      join(repoDir, "gitnexus"),
+      `#!/bin/sh\necho repo-bin >> "${markerPath}"\nexit 0\n`,
+    )
+    createExecutable(
+      join(trustedBinDir, "which"),
+      `#!/bin/sh\necho which-hijack >> "${markerPath}"\nprintf '%s\\n' "${evilRepoBin}"\nexit 0\n`,
+    )
+
+    const resolved = resolveLocalGitnexusBin(
+      { PATH: trustedBinDir },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, null)
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("never executes a malicious 'where' binary placed on PATH", () => {
+    const evilRepoBin = createExecutable(
+      join(repoDir, "gitnexus"),
+      `#!/bin/sh\necho repo-bin >> "${markerPath}"\nexit 0\n`,
+    )
+    createExecutable(
+      join(trustedBinDir, "where"),
+      `#!/bin/sh\necho where-hijack >> "${markerPath}"\nprintf '%s\\n' "${evilRepoBin}"\nexit 0\n`,
+    )
+
+    const resolved = resolveLocalGitnexusBin(
+      { PATH: trustedBinDir },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, null)
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("rejects a symlink in a trusted PATH directory that resolves into the repository", () => {
+    const evilRepoBin = createExecutable(
+      join(repoDir, "evil-gitnexus"),
+      `#!/bin/sh\necho symlink-hijack >> "${markerPath}"\nexit 0\n`,
+    )
+    const symlinkBin = join(trustedBinDir, "gitnexus")
+    symlinkSync(evilRepoBin, symlinkBin)
+
+    const resolved = resolveLocalGitnexusBin(
+      { PATH: trustedBinDir },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, null)
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("rejects GITNEXUS_BIN when relative, inside the repository, or a symlink into the repository", () => {
+    const evilRepoBin = createExecutable(
+      join(repoDir, "evil-gitnexus"),
+      `#!/bin/sh\necho gitnexus-bin-hijack >> "${markerPath}"\nexit 0\n`,
+    )
+    const symlinkBin = join(trustedBinDir, "gitnexus-link")
+    symlinkSync(evilRepoBin, symlinkBin)
+
+    assert.equal(
+      resolveLocalGitnexusBin({ GITNEXUS_BIN: "./gitnexus" }, { worktree: repoDir }),
+      null,
+    )
+    assert.equal(
+      resolveLocalGitnexusBin({ GITNEXUS_BIN: evilRepoBin }, { worktree: repoDir }),
+      null,
+    )
+    assert.equal(
+      resolveLocalGitnexusBin({ GITNEXUS_BIN: symlinkBin }, { worktree: repoDir }),
+      null,
+    )
+    assert.equal(existsSync(markerPath), false)
+  })
+
+  it("accepts a trusted GITNEXUS_BIN outside the repository and returns its canonical realpath", () => {
+    const realBin = createExecutable(join(trustedBinDir, "gitnexus-real"))
+    const linkInTrusted = join(trustedBinDir, "gitnexus")
+    symlinkSync(realBin, linkInTrusted)
+
+    const resolved = resolveLocalGitnexusBin(
+      { GITNEXUS_BIN: linkInTrusted },
+      { worktree: repoDir },
+    )
+    assert.equal(resolved, realpathSync(realBin))
+  })
+
+  it("compatibility check never executes an untrusted repository binary", () => {
+    const evilRepoBin = createExecutable(
+      join(repoDir, "gitnexus"),
+      `#!/bin/sh\necho compat-pwned >> "${markerPath}"\necho "1.6.12"\n`,
+    )
+    const nmBin = createExecutable(
+      join(repoDir, "node_modules", ".bin", "gitnexus"),
+      `#!/bin/sh\necho nm-pwned >> "${markerPath}"\necho "1.6.12"\n`,
+    )
+    assert.ok(existsSync(evilRepoBin))
+    assert.ok(existsSync(nmBin))
+
+    let runnerCalled = false
+    const compat = checkGitNexusCliCompatibility({
+      env: {
+        PATH: [".", repoDir, join(repoDir, "node_modules", ".bin")].join(delimiter),
+      },
+      worktree: repoDir,
+      execRunner: () => {
+        runnerCalled = true
+        return "1.6.12\n"
+      },
+    })
+    assert.equal(compat.compatible, false)
+    assert.equal(compat.binary, null)
+    assert.equal(runnerCalled, false)
+    assert.equal(existsSync(markerPath), false)
+  })
+})
+
+describe("Version Compatibility & Capability Detection (COMP-001, SEC-004, SEC-005)", () => {
+  let tmpBinDir: string
+  let trustedBin: string
+
+  beforeEach(() => {
+    tmpBinDir = mkdtempSync(join(tmpdir(), "gitnexus-compat-bin-"))
+    trustedBin = createExecutable(join(tmpBinDir, "gitnexus"))
+  })
+
+  afterEach(() => {
+    rmSync(tmpBinDir, { recursive: true, force: true })
+  })
+
   it("compares SemVer numerically rather than lexicographically", () => {
     assert.ok(compareSemVer("1.10.0", "1.6.12") > 0)
     assert.ok(compareSemVer("1.6.12", "1.6.12") === 0)
@@ -189,7 +401,7 @@ describe("Version Compatibility & Capability Detection (COMP-001, SEC-004)", () 
 
   it("accepts a supported local CLI version that advertises --index-only", () => {
     const res = checkGitNexusCliCompatibility({
-      env: { GITNEXUS_BIN: "/usr/local/bin/gitnexus" },
+      env: { GITNEXUS_BIN: trustedBin },
       execRunner: (_file, args) => {
         if (args[0] === "--version") return "1.6.12\n"
         if (args[0] === "analyze" && args[1] === "--help") {
@@ -199,13 +411,14 @@ describe("Version Compatibility & Capability Detection (COMP-001, SEC-004)", () 
       },
     })
     assert.equal(res.compatible, true)
+    assert.equal(res.binary, realpathSync(trustedBin))
     assert.equal(res.version, "1.6.12")
     assert.equal(res.supportsIndexOnly, true)
   })
 
   it("identifies and rejects old CLI versions (< 1.6.12) with a clear error message", () => {
     const res = checkGitNexusCliCompatibility({
-      env: { GITNEXUS_BIN: "/usr/local/bin/gitnexus" },
+      env: { GITNEXUS_BIN: trustedBin },
       execRunner: (_file, args) => {
         if (args[0] === "--version") return "1.5.2\n"
         return ""
@@ -218,7 +431,7 @@ describe("Version Compatibility & Capability Detection (COMP-001, SEC-004)", () 
 
   it("reports clearly when CLI does not support --index-only", () => {
     const res = checkGitNexusCliCompatibility({
-      env: { GITNEXUS_BIN: "/usr/local/bin/gitnexus" },
+      env: { GITNEXUS_BIN: trustedBin },
       execRunner: (_file, args) => {
         if (args[0] === "--version") return "1.6.12\n"
         if (args[0] === "analyze" && args[1] === "--help") {
@@ -234,7 +447,7 @@ describe("Version Compatibility & Capability Detection (COMP-001, SEC-004)", () 
 
   it("fails safely on malformed version output", () => {
     const res = checkGitNexusCliCompatibility({
-      env: { GITNEXUS_BIN: "/usr/local/bin/gitnexus" },
+      env: { GITNEXUS_BIN: trustedBin },
       execRunner: () => "gitnexus-custom-dev-build\n",
     })
     assert.equal(res.compatible, false)
